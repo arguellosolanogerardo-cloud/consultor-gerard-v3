@@ -1,0 +1,45 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+*.class
+.Python
+.venv/
+venv/
+ENV/
+env/
+
+# FAISS y índices grandes (NO van a GitHub)
+faiss_index_backup/
+faiss_index_new/
+faiss_index/
+*.zip
+*.faiss
+index.pkl
+bm25_index.pkl
+chroma_db.zip
+*.pkl
+
+# Logs y cache
+*.log
+logs/
+.geo_cache.json
+
+# Backups
+.backup*/
+backup*/
+*.tmp
+*.bak
+
+# IDE
+.vs/
+.vscode/
+.idea/
+
+# Secrets
+client_secret.json
+google_credentials.json
+.streamlit/secrets.toml
+test_credentials.json
+
+# Archivos de documentación local (grandes)
+documentos_srt/
