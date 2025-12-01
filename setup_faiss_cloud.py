@@ -76,19 +76,49 @@ def download_faiss_from_release():
         return False
 
 def check_faiss_exists():
-    """Verifica si ya existe el índice FAISS"""
+    """Verifica si ya existe el índice FAISS COMPLETO desde GitHub Release"""
     faiss_files = [
         Path("faiss_index/index.faiss"),
         Path("faiss_index/index.pkl"),
     ]
     
-    for f in faiss_files:
-        if f.exists():
+    # Verificar que todos los archivos existan
+    all_exist = all(f.exists() for f in faiss_files)
+    
+    if not all_exist:
+        return False
+    
+    # Verificar que tenga el marcador de descarga desde Release
+    marker = Path("faiss_index/.faiss_ready")
+    if not marker.exists():
+        print("[WARNING] ⚠️  Índice FAISS existe pero NO tiene marcador de Release")
+        print("[WARNING] ⚠️  Probablemente es un placeholder antiguo")
+        print("[INFO] Se eliminará y descargará el índice completo")
+        
+        # Eliminar índice antiguo
+        import shutil
+        try:
+            shutil.rmtree("faiss_index")
+            print("[INFO] Índice antiguo eliminado")
+        except Exception as e:
+            print(f"[WARNING] Error eliminando índice antiguo: {e}")
+        
+        return False
+    
+    # Si tiene el marcador, verificar contenido
+    with open(marker, 'r') as f:
+        content = f.read().strip()
+    
+    if content == "downloaded_from_release":
+        # Mostrar tamaño de archivos
+        for f in faiss_files:
             size_mb = f.stat().st_size / (1024 * 1024)
             print(f"[INFO] Índice FAISS encontrado: {f} ({size_mb:.2f} MB)")
-            return True
-    
-    return False
+        return True
+    else:
+        print("[WARNING] ⚠️  Marcador de índice inválido")
+        return False
+
 
 def create_empty_faiss_placeholder():
     """Crea un índice FAISS vacío como placeholder"""
