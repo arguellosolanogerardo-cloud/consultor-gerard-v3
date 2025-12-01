@@ -1261,6 +1261,15 @@ with col2:
     st.image("assets/gerardfull.jpg", use_container_width=True)
 st.markdown('<div class="subtitle">v3.69 | ASISTENTE</div>', unsafe_allow_html=True)
 
+# IMPORTANTE: Inicializar recursos AL INICIO para descargar FAISS si es necesario
+# Esto asegura que el índice se descargue al cargar la app, no cuando alguien pregunta
+try:
+    load_resources()
+except Exception as e:
+    st.error(f"❌ Error inicializando sistema: {e}")
+    st.stop()
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║  DETECTOR DE IP REAL DEL USUARIO - SE EJECUTA EN CADA CARGA     ║
