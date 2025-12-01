@@ -1338,6 +1338,9 @@ if not st.session_state.user_name:
                         st.error("❌ Error al iniciar sesión con Google.")
 
             if login_url:
+                # DEBUG: Mostrar la URL generada para diagnóstico
+                st.info(f"🔍 DEBUG - URL de login generada: {login_url[:100]}...")
+                
                 st.markdown(
                     f'''
                     <style>
