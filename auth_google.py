@@ -32,8 +32,20 @@ def get_flow(redirect_uri):
         )
     # PRIORIDAD 2: Intentar cargar desde secrets (Cloud)
     elif "google_auth" in st.secrets:
-        # google-auth-oauthlib espera una estructura {"web": {...}}
-        client_config = {"web": dict(st.secrets["google_auth"])}
+        # Construir manualmente el client_config con la estructura correcta
+        secrets_auth = st.secrets["google_auth"]
+        client_config = {
+            "web": {
+                "client_id": secrets_auth["client_id"],
+                "project_id": secrets_auth["project_id"],
+                "auth_uri": secrets_auth["auth_uri"],
+                "token_uri": secrets_auth["token_uri"],
+                "auth_provider_x509_cert_url": secrets_auth["auth_provider_x509_cert_url"],
+                "client_secret": secrets_auth["client_secret"],
+                # Incluir redirect_uris explícitamente para que OAuth funcione
+                "redirect_uris": [redirect_uri]
+            }
+        }
         flow = google_auth_oauthlib.flow.Flow.from_client_config(
             client_config,
             scopes=SCOPES
