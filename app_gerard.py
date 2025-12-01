@@ -1313,11 +1313,7 @@ if not st.session_state.user_name:
             
             # Botón de Login con Google
             # Detectar URL base para redirect
-            if "streamlit.app" in str(st.query_params) or os.getenv("STREAMLIT_SERVER_HEADLESS") == "true":
-                 redirect_uri = "https://consultor-gerard-v2-zrg5ejmgryrttxhtxwqlxz.streamlit.app/"
-            else:
-                 redirect_uri = "http://localhost:8501/"
-                 
+            redirect_uri = "https://consultor-gerard-v3-zrg5ejmgryrttxhtxwqlxz.streamlit.app/"
             login_url = auth_google.get_login_url(redirect_uri) 
             
             # Verificar si volvemos de un redirect de Google
