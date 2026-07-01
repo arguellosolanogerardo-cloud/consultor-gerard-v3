@@ -1314,12 +1314,24 @@ def load_resources():
         except Exception as e:
             raise RuntimeError(f"Error configurando FAISS: {e}")
     
-    # Detectar API key de Google
+    # Detectar API key de Google (con búsqueda recursiva en subsecciones de st.secrets)
     api_key = os.environ.get("GOOGLE_API_KEY")
     if not api_key:
         try:
-            if hasattr(st, "secrets") and "GOOGLE_API_KEY" in st.secrets:
-                api_key = st.secrets["GOOGLE_API_KEY"]
+            if hasattr(st, "secrets"):
+                if "GOOGLE_API_KEY" in st.secrets:
+                    api_key = st.secrets["GOOGLE_API_KEY"]
+                else:
+                    # En TOML, si se define al final del archivo después de [vertex_ai],
+                    # queda agrupada dentro de ese diccionario. Buscamos recursivamente:
+                    for key in st.secrets.keys():
+                        try:
+                            section = st.secrets[key]
+                            if hasattr(section, "get") and "GOOGLE_API_KEY" in section:
+                                api_key = section["GOOGLE_API_KEY"]
+                                break
+                        except Exception:
+                            continue
         except Exception:
             pass
 
