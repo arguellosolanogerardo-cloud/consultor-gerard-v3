@@ -1339,7 +1339,12 @@ def load_resources():
     embeddings = None
 
     # Inicializar LLM y Embeddings usando Google AI Studio (API Key) si está disponible
-    if GENAI_AVAILABLE and api_key:
+    if api_key:
+        if not GENAI_AVAILABLE:
+            raise ImportError(
+                "La API Key de Google está configurada en los secrets, pero la librería 'langchain-google-genai' "
+                "no está disponible en el entorno de Streamlit Cloud. Verifica que requirements.txt se haya instalado correctamente."
+            )
         try:
             # Usar gemini-1.5-flash como modelo rápido y gratuito por defecto
             llm = ChatGoogleGenerativeAI(
@@ -1357,16 +1362,9 @@ def load_resources():
             print("[OK] Inicializado exitosamente con Google AI Studio (API Key)")
         except Exception as e:
             os.environ["GERARD_LLM_BACKEND_ERR"] = str(e)
-            print(f"[WARNING] Falló inicialización con Google AI Studio: {e}. Usando fallback a Vertex AI...")
-            llm = None
-            embeddings = None
+            print(f"[ERROR] Falló inicialización con Google AI Studio: {e}")
+            raise RuntimeError(f"Error al inicializar Google AI Studio (API Key): {e}")
     else:
-        if not GENAI_AVAILABLE:
-            os.environ["GERARD_LLM_BACKEND_ERR"] = "Librería langchain_google_genai no disponible"
-        elif not api_key:
-            os.environ["GERARD_LLM_BACKEND_ERR"] = "GOOGLE_API_KEY no configurada en variables de entorno ni st.secrets"
-
-    if llm is None or embeddings is None:
         # Fallback original: Vertex AI (Cuenta de Servicio)
         llm = ChatVertexAI(
             model="gemini-2.5-pro",
