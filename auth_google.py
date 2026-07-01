@@ -69,6 +69,11 @@ def get_login_url(redirect_uri):
         access_type='offline',
         include_granted_scopes='true'
     )
+    
+    # Guardar el code_verifier generado en session_state para poder validarlo al regresar
+    if hasattr(flow, 'code_verifier'):
+        st.session_state['oauth_code_verifier'] = flow.code_verifier
+        
     return authorization_url
 
 
@@ -82,6 +87,10 @@ def get_user_info(code, redirect_uri):
         if not flow:
             return None
             
+        # Restaurar el code_verifier guardado para pasar la validación PKCE de Google
+        if 'oauth_code_verifier' in st.session_state:
+            flow.code_verifier = st.session_state['oauth_code_verifier']
+            
         flow.fetch_token(code=code)
         credentials = flow.credentials
         
@@ -91,5 +100,7 @@ def get_user_info(code, redirect_uri):
         
         return user_info
     except Exception as e:
+        import traceback
         print(f"Error obteniendo info de usuario: {e}")
+        traceback.print_exc()
         return None
