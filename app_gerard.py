@@ -12,11 +12,35 @@ import io
 import base64
 import uuid
 from langchain_google_vertexai import ChatVertexAI, VertexAIEmbeddings
+try:
+    from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+    GENAI_AVAILABLE = True
+except ImportError:
+    GENAI_AVAILABLE = False
 from langchain_community.vectorstores import FAISS
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from cities_data import get_cities_for_country
 import streamlit.components.v1 as components
+from geo_utils import GeoLocator
+from google_sheets_logger import create_sheets_logger
+from document_title_filter import hybrid_search_with_title, detect_title_in_query
+
+# Importar streamlit_js_eval para comunicación JavaScript <-> Python (micrófono)
+try:
+    from streamlit_js_eval import streamlit_js_eval
+    JS_EVAL_AVAILABLE = True
+except ImportError:
+    JS_EVAL_AVAILABLE = False
+    print("[WARNING] streamlit-js-eval no disponible - el micrófono funcionará en modo manual")
+
+# Importar servicio de Text-to-Speech (Google Cloud TTS)
+try:
+    from tts_service import synthesize_text_to_mp3, create_audio_html, TTS_AVAILABLE
+    print(f"[INFO] Servicio TTS {'disponible' if TTS_AVAILABLE else 'NO disponible'}")
+except ImportError:
+    TTS_AVAILABLE = False
+    print("[WARNING] tts_service no disponible - TTS deshabilitado")
 
 # Intentar importar auth_google (opcional - solo para login con Google)
 try:
@@ -26,6 +50,9 @@ except ImportError:
     GOOGLE_AUTH_AVAILABLE = False
     print("[WARNING] Google Auth no disponible - falta google-api-python-client")
 
+# ===== CONFIGURACIÓN DE LOGIN =====
+# Habilita/deshabilita el formulario de ingreso manual
+ENABLE_MANUAL_LOGIN = False  # Cambia a False para reactivar el ingreso manual
 
 # ===== FUNCIONES DE GENERACIÓN DE PDF (CON WEASYPRINT) =====
 # Verificar disponibilidad de weasyprint (prioridad) y reportlab (fallback)
@@ -36,9 +63,13 @@ REPORTLAB_AVAILABLE = False
 try:
     from weasyprint import HTML, CSS
     WEASYPRINT_AVAILABLE = True
-    print("[INFO] Weasyprint disponible para generación de PDF")
-except ImportError:
-    print("[WARNING] Weasyprint no disponible")
+    print("[INFO] ✅ Weasyprint disponible para generación de PDF con colores")
+except ImportError as e:
+    print(f"[WARNING] Weasyprint no disponible (ImportError): {e}")
+    WEASYPRINT_AVAILABLE = False
+except Exception as e:
+    print(f"[WARNING] Error al importar Weasyprint: {type(e).__name__}: {e}")
+    WEASYPRINT_AVAILABLE = False
 
 # Intentar importar reportlab SIEMPRE (no solo si weasyprint falla)
 try:
@@ -77,7 +108,7 @@ def generate_pdf_from_html_local(
                         margin: 2cm;
                     }
                     body {
-                        font-family: 'Helvetica', 'Arial', sans-serif;
+                        font-family: 'Merriweather', 'Georgia', 'Times New Roman', serif;
                         font-size: 10pt;
                         line-height: 1.6;
                         color: #000;
@@ -88,22 +119,77 @@ def generate_pdf_from_html_local(
                         text-align: center;
                         margin: 20px 0;
                         page-break-after: avoid;
+                        color: #000;
+                        text-transform: uppercase;
                     }
                     h2 {
                         font-size: 14pt;
                         font-weight: bold;
                         margin: 15px 0 10px 0;
                         page-break-after: avoid;
+                        color: #000;
                     }
                     h3 {
                         font-size: 12pt;
                         font-weight: bold;
                         margin: 12px 0 8px 0;
                         page-break-after: avoid;
+                        color: #000;
                     }
-                    /* Preservar TODOS los colores del HTML */
-                    span, font {
+                    p {
+                        margin: 10px 0;
+                        line-height: 1.8;
+                    }
+                    /* Preservar TODOS los colores inline de los spans */
+                    span[style*="color"] {
                         /* Los colores inline se preservan automáticamente */
+                    }
+                    /* Citas de texto en AZUL - #61AFEF */
+                    span[style*="#61AFEF"] {
+                        color: #61AFEF !important;
+                        font-family: 'Merriweather', serif;
+                        font-size: 12pt;
+                        font-style: italic;
+                    }
+                    /* Referencias de documentos en VERDE OSCURO - #2E7D32 */
+                    span[style*="#2E7D32"] {
+                        color: #2E7D32 !important;
+                        font-family: 'Merriweather', serif;
+                        font-size: 13pt;
+                        font-weight: bold;
+                    }
+                    /* Mantener compatibilidad con color antiguo por si acaso */
+                    span[style*="#98C379"] {
+                        color: #2E7D32 !important;
+                        font-family: 'Merriweather', serif;
+                        font-size: 13pt;
+                        font-weight: bold;
+                    }
+                    /* Timestamps en ROJO - #FF0000 */
+                    span[style*="#FF0000"] {
+                        color: #FF0000 !important;
+                        font-family: 'Merriweather', serif;
+                        font-size: 11pt;
+                        font-weight: bold;
+                    }
+                    /* Encabezados especiales en AMARILLO - #E5C07B */
+                    span[style*="#E5C07B"] {
+                        color: #E5C07B !important;
+                        font-family: 'Merriweather', serif;
+                        font-size: 14pt;
+                        font-weight: bold;
+                    }
+                    /* Encabezados ####** en AMARILLO INTENSO - #FFD700 */
+                    .header-level-4 {
+                        color: #FFD700 !important;
+                        font-family: 'Merriweather', serif;
+                        font-size: 18pt;
+                        font-weight: bold;
+                        text-transform: uppercase;
+                        text-align: center;
+                        margin: 20px 0;
+                        padding: 10px 0;
+                        letter-spacing: 1px;
                     }
                     hr {
                         border: none;
@@ -112,6 +198,11 @@ def generate_pdf_from_html_local(
                     }
                     /* Evitar que las citas se partan entre páginas */
                     .citation-block {
+                        page-break-inside: avoid;
+                    }
+                    /* Espaciado entre preguntas y respuestas */
+                    .question-block {
+                        margin-top: 30px;
                         page-break-inside: avoid;
                     }
                 </style>
@@ -245,6 +336,20 @@ st.markdown("""
     /* Importar fuentes */
     @import url('https://fonts.googleapis.com/css2?family=Merriweather:ital,wght@0,400;0,700;1,400;1,700&display=swap');
     
+    /* Estilo para encabezados de nivel 4 (####**texto**) - NUEVO */
+    .header-level-4 {
+        color: #FFD700 !important; /* Amarillo Intenso (Gold) */
+        font-family: 'Merriweather', serif !important;
+        font-size: 26px !important;
+        font-weight: bold !important;
+        text-transform: uppercase !important;
+        text-align: center !important;
+        margin: 30px 0 !important;
+        padding: 15px 0 !important;
+        letter-spacing: 1px !important;
+        line-height: 1.4 !important;
+    }
+    
     /* ONE DARK PRO - Tema Global */
     .stApp {
         background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
@@ -312,6 +417,16 @@ st.markdown("""
     .stButton > button:hover {
         box-shadow: 0 6px 25px rgba(97, 175, 239, 0.5) !important;
         transform: translateY(-2px) !important;
+    }
+    
+    /* Estilo para botón en estado EJECUTADO (Rojo) - Activado por marcador adyacente */
+    /* Busca un div que contenga .executed-marker y afecta al SIGUIENTE div (el del botón) */
+    div:has(.executed-marker) + div .stButton > button {
+        background: linear-gradient(135deg, #FF4B4B, #CC0000) !important;
+        border: 2px solid #FF0000 !important;
+        box-shadow: 0 0 20px rgba(255, 0, 0, 0.6) !important;
+        transform: scale(0.98) !important; /* Ligeramente presionado */
+        content: "🔴 PREGUNTA EJECUTADA"; /* Fallback visual */
     }
     
     /* Contenedor de respuestas */
@@ -532,15 +647,205 @@ st.markdown("""
     .response-container span[style*="#E06C75"] {
         color: #E06C75 !important;
     }
+
+    /* === MODAL DE NOTIFICACIÓN MODERNO (GERARD NEO-MODAL) === */
+    @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700&display=swap');
+
+    .gerard-notification-overlay {
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        background: rgba(10, 10, 15, 0.85);
+        backdrop-filter: blur(15px);
+        -webkit-backdrop-filter: blur(15px);
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        z-index: 9999999;
+        animation: modalFadeIn 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+
+    .gerard-notification-content {
+        background: linear-gradient(135deg, rgba(15, 15, 25, 0.95) 0%, rgba(25, 25, 40, 0.9) 100%);
+        border: 2px solid #00ff41;
+        border-radius: 24px;
+        padding: 40px;
+        max-width: 500px;
+        width: 90%;
+        text-align: center;
+        box-shadow: 0 0 40px rgba(0, 255, 65, 0.2), 
+                    inset 0 0 20px rgba(0, 255, 65, 0.1);
+        font-family: 'Orbitron', sans-serif;
+        color: white;
+        position: relative;
+        overflow: hidden;
+        animation: modalSlideUp 0.5s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+    }
+
+    /* Efectos de luz para el modal */
+    .gerard-notification-content::before {
+        content: '';
+        position: absolute;
+        top: -50%;
+        left: -50%;
+        width: 200%;
+        height: 200%;
+        background: radial-gradient(circle, rgba(0, 255, 65, 0.05) 0%, transparent 70%);
+        pointer-events: none;
+    }
+
+    .modal-icon-container {
+        width: 80px;
+        height: 80px;
+        background: rgba(0, 255, 65, 0.1);
+        border: 2px solid #00ff41;
+        border-radius: 50%;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        margin: 0 auto 25px;
+        box-shadow: 0 0 20px rgba(0, 255, 65, 0.4);
+    }
+
+    .modal-icon-container svg {
+        width: 40px;
+        height: 40px;
+        fill: #00ff41;
+        filter: drop-shadow(0 0 8px rgba(0, 255, 65, 0.8));
+    }
+
+    .modal-title {
+        color: #00ff41;
+        font-size: 24px;
+        font-weight: 700;
+        margin-bottom: 20px;
+        text-transform: uppercase;
+        letter-spacing: 2px;
+        text-shadow: 0 0 10px rgba(0, 255, 65, 0.5);
+    }
+
+    .modal-message {
+        color: #e0e0e0;
+        font-size: 16px;
+        line-height: 1.6;
+        margin-bottom: 30px;
+    }
+
+    .modal-button {
+        background: linear-gradient(45deg, #00ff41, #00d4ff);
+        color: #000;
+        border: none;
+        padding: 15px 40px;
+        border-radius: 12px;
+        font-size: 18px;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 1px;
+        cursor: pointer;
+        transition: all 0.3s;
+        box-shadow: 0 0 15px rgba(0, 255, 65, 0.4);
+        width: 100%;
+    }
+
+    .modal-button:hover {
+        transform: translateY(-3px) scale(1.02);
+        box-shadow: 0 5px 25px rgba(0, 255, 65, 0.6);
+    }
+
+    @keyframes modalFadeIn {
+        from { opacity: 0; }
+        to { opacity: 1; }
+    }
+
+    @keyframes modalSlideUp {
+        from { transform: translateY(50px); opacity: 0; }
+        to { transform: translateY(0); opacity: 1; }
+    }
 </style>
+
+<script>
+// Sistema de Notificaciones Modernas GERARD Neo-Player
+(function() {
+    // Esperar a que el DOM esté listo
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', initNotificationSystem);
+    } else {
+        initNotificationSystem();
+    }
+    
+    function initNotificationSystem() {
+        // Definir la función en window (no window.parent, porque este script ya está en el contexto correcto)
+        window.showGerardNotification = function(title, message, type) {
+            type = type || 'success';
+            
+            // Eliminar modal anterior si existe
+            const oldModal = document.getElementById('gerard-modal-overlay');
+            if (oldModal) oldModal.remove();
+            
+            // Crear overlay
+            const overlay = document.createElement('div');
+            overlay.id = 'gerard-modal-overlay';
+            overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(10,10,15,0.85);backdrop-filter:blur(15px);-webkit-backdrop-filter:blur(15px);display:flex;justify-content:center;align-items:center;z-index:9999999;';
+            
+            const iconSvg = type === 'success' 
+                ? '<svg viewBox="0 0 24 24" style="width:40px;height:40px;fill:#00ff41;filter:drop-shadow(0 0 8px rgba(0,255,65,0.8));"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41L9 16.17z"/><\/svg>'
+                : '<svg viewBox="0 0 24 24" style="width:40px;height:40px;fill:#00ff41;"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/><\/svg>';
+
+            overlay.innerHTML = '<div style="background:linear-gradient(135deg,rgba(15,15,25,0.95),rgba(25,25,40,0.9));border:2px solid #00ff41;border-radius:24px;padding:40px;max-width:500px;width:90%;text-align:center;box-shadow:0 0 40px rgba(0,255,65,0.2);font-family:Orbitron,sans-serif;color:white;position:relative;overflow:hidden;"><div style="width:80px;height:80px;background:rgba(0,255,65,0.1);border:2px solid #00ff41;border-radius:50%;display:flex;justify-content:center;align-items:center;margin:0 auto 25px;box-shadow:0 0 20px rgba(0,255,65,0.4);">'+iconSvg+'<\/div><div style="color:#00ff41;font-size:24px;font-weight:700;margin-bottom:20px;text-transform:uppercase;letter-spacing:2px;text-shadow:0 0 10px rgba(0,255,65,0.5);">'+title+'<\/div><div style="color:#e0e0e0;font-size:16px;line-height:1.6;margin-bottom:30px;">'+message+'<\/div><button id="gerard-modal-close-btn" style="background:linear-gradient(45deg,#00ff41,#00d4ff);color:#000;border:none;padding:15px 40px;border-radius:12px;font-size:18px;font-weight:700;text-transform:uppercase;letter-spacing:1px;cursor:pointer;box-shadow:0 0 15px rgba(0,255,65,0.4);width:100%;">ENTENDIDO<\/button><div style="position:absolute;bottom:0;left:0;height:3px;background:#00ff41;width:100%;animation:barWait 5s linear forwards;"><\/div><\/div><style>@keyframes barWait{from{width:100%}to{width:0%}}<\/style>';
+
+
+            document.body.appendChild(overlay);
+
+            // Event listener para el botón de cerrar
+            const closeBtn = document.getElementById('gerard-modal-close-btn');
+            if (closeBtn) {
+                closeBtn.onclick = function() {
+                    overlay.remove();
+                };
+            }
+
+            // Auto-cerrar después de 5 segundos
+            setTimeout(function() {
+                if (overlay && overlay.parentNode) {
+                    overlay.remove();
+                }
+            }, 5000);
+            
+            // Cerrar al hacer clic fuera del contenido
+            overlay.addEventListener('click', function(e) {
+                if (e.target === overlay) {
+                    overlay.remove();
+                }
+            });
+        };
+        
+        console.log('[GERARD] ✅ Sistema de notificaciones modernas inicializado');
+    }
+})();
+</script>
 """, unsafe_allow_html=True)
 
 # Configurar credenciales de Vertex AI
+
 # En Streamlit Cloud usa secrets, localmente usa archivo
 # @st.cache_resource - REMOVIDO para asegurar que os.environ se configure en cada worker/hilo
 def setup_gcp_credentials():
     """Configura las credenciales de GCP una sola vez por sesión"""
-    if "gcp_service_account" in st.secrets:
+    
+    # Intentar detectar si st.secrets está disponible y tiene gcp_service_account
+    has_secrets = False
+    try:
+        # Verificar si st.secrets existe y tiene la configuración necesaria
+        if hasattr(st, 'secrets') and 'gcp_service_account' in st.secrets:
+            has_secrets = True
+    except Exception as e:
+        # Si falla (por ejemplo, no hay secrets.toml), continuar sin secrets
+        print(f"[INFO] st.secrets no disponible: {e}")
+        has_secrets = False
+    
+    if has_secrets:
         # Streamlit Cloud: usa secrets
         import json
         import tempfile
@@ -558,10 +863,29 @@ def setup_gcp_credentials():
             credentials_path = f.name
         
         os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = credentials_path
-        print(f"[INFO] Credenciales GCP configuradas en: {credentials_path}")
+        print(f"[INFO] Credenciales GCP configuradas desde st.secrets: {credentials_path}")
     else:
-        # Local: usa google_credentials.json que tiene Drive API habilitada
-        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "google_credentials.json"
+        # Local/Render: detectar automáticamente el archivo correcto
+        # Prioridad: archivo sin espacios (Render) -> archivo con espacios (Local)
+        credential_paths = [
+            "google_credentials.json",  # Render/producción sin espacios
+            "credencial_json_midyear-node-436821-t3-525a146e96a0.json",  # Alternativa sin espacios
+            "credencial json/midyear-node-436821-t3-525a146e96a0.json"  # Local con espacios
+        ]
+        
+        credentials_file = None
+        for path in credential_paths:
+            if os.path.exists(path):
+                credentials_file = path
+                print(f"[INFO] Usando credenciales desde: {path}")
+                break
+        
+        if credentials_file:
+            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = credentials_file
+        else:
+            print("[WARNING] No se encontró archivo de credenciales local.")
+
+
 
 # Ejecutar configuración de credenciales
 setup_gcp_credentials()
@@ -990,18 +1314,50 @@ def load_resources():
         except Exception as e:
             raise RuntimeError(f"Error configurando FAISS: {e}")
     
-    # LLM
-    llm = ChatVertexAI(
-        model="gemini-2.5-pro",
-        project="midyear-node-436821-t3",
-        temperature=0.3
-    )
-    
-    # Embeddings
-    embeddings = VertexAIEmbeddings(
-        model_name="text-multilingual-embedding-002",
-        project="midyear-node-436821-t3"
-    )
+    # Detectar API key de Google
+    api_key = os.environ.get("GOOGLE_API_KEY")
+    if not api_key:
+        try:
+            if hasattr(st, "secrets") and "GOOGLE_API_KEY" in st.secrets:
+                api_key = st.secrets["GOOGLE_API_KEY"]
+        except Exception:
+            pass
+
+    llm = None
+    embeddings = None
+
+    # Inicializar LLM y Embeddings usando Google AI Studio (API Key) si está disponible
+    if GENAI_AVAILABLE and api_key:
+        try:
+            # Usar gemini-1.5-flash como modelo rápido y gratuito por defecto
+            llm = ChatGoogleGenerativeAI(
+                model="gemini-1.5-flash",
+                temperature=0.3,
+                google_api_key=api_key
+            )
+            # Usar text-embedding-004 de Google AI Studio (compatible con dimensión 768)
+            embeddings = GoogleGenerativeAIEmbeddings(
+                model="models/text-embedding-004",
+                google_api_key=api_key
+            )
+            print("[OK] Inicializado exitosamente con Google AI Studio (API Key)")
+        except Exception as e:
+            print(f"[WARNING] Falló inicialización con Google AI Studio: {e}. Usando fallback a Vertex AI...")
+            llm = None
+            embeddings = None
+
+    if llm is None or embeddings is None:
+        # Fallback original: Vertex AI (Cuenta de Servicio)
+        llm = ChatVertexAI(
+            model="gemini-2.5-pro",
+            project="midyear-node-436821-t3",
+            temperature=0.3
+        )
+        embeddings = VertexAIEmbeddings(
+            model_name="text-multilingual-embedding-002",
+            project="midyear-node-436821-t3"
+        )
+        print("[INFO] Usando Vertex AI (Cuenta de Servicio)")
     
     # FAISS Vector Store
     faiss_vs = FAISS.load_local(
@@ -1060,7 +1416,7 @@ Eres un Agente Analítico Forense especializado en la extracción de informació
 
 **FORMATO OBLIGATORIO para CADA cita:**
 
-**[Documento: nombre_archivo.srt | Timestamp: HH:MM:SS --> HH:MM:SS]**
+**[VIDEO / AUDIO: nombre_archivo.srt | Minuto: HH:MM:SS --> HH:MM:SS]**
 "TEXTO LITERAL EXACTO DEL SUBTÍTULO QUE DEBE APARECER AQUÍ SIEMPRE"
 
 **REGLAS CRÍTICAS DE CITACIÓN:**
@@ -1080,12 +1436,53 @@ Eres un Agente Analítico Forense especializado en la extracción de informació
 
 ---
 
+## 🔍 BÚSQUEDAS POR TÍTULO/AUDIO/VIDEO DE DOCUMENTO:
+
+Cuando el usuario pregunta específicamente por un **documento, archivo, audio o video** usando su título o ID:
+
+**PASO 1: VERIFICACIÓN**
+- Revisa el campo `[VIDEO / AUDIO: nombre_archivo.srt]` de cada fragmento del contexto
+- Identifica si los fragmentos pertenecen al documento mencionado por el usuario
+- Los usuarios pueden referirse a los documentos como: "documento", "archivo", "audio", "video"
+
+**PASO 2: DECLARACIÓN DE ESTADO**
+- Si **NO hay fragmentos** del documento/audio/video solicitado en el contexto:
+  → Declara explícitamente: "No se encontraron fragmentos del [documento/audio/video] '[título]' en el contexto proporcionado"
+  → NO inventes información
+  → NO uses conocimiento general
+  
+- Si **SÍ hay fragmentos** del documento/audio/video solicitado:
+  → Procesa ÚNICAMENTE esos fragmentos
+  → Ignora fragmentos de otros documentos/audios/videos
+  → Responde la pregunta basándote solo en esos fragmentos específicos
+
+**PASO 3: RESPUESTA**
+- Cada cita DEBE incluir el nombre del archivo fuente
+- Mantén el mismo formato de citación obligatorio: `**[VIDEO / AUDIO: ...]** "texto literal"`
+- Agrupa la información temáticamente si hay múltiples fragmentos
+
+**EJEMPLO DE RESPUESTA CORRECTA:**
+Si el usuario pregunta: "EN EL AUDIO DE TÍTULO: Para que se dejo Donald trump como presidente. QUE INFORMACION SE DA DE MARIA MAGDALENA?"
+
+Y el contexto contiene fragmentos de ese audio, responde:
+```
+**INFORMACIÓN SOBRE MARÍA MAGDALENA EN EL AUDIO SOLICITADO**
+
+**[VIDEO / AUDIO: Para que se dejo Donald trump como presidente [nPNE9qHlUfY].es.srt | Minuto: 00:05:23 --> 00: 05:45]**
+"maría magdalena era una gran maestra espiritual que acompañó al maestro jesús..."
+
+**[VIDEO / AUDIO: Para que se dejo Donald trump como presidente [nPNE9qHlUfY].es.srt | Minuto: 00:12:10 --> 00:12:33]**
+"ella fue la única mujer entre los discípulos..."
+```
+
+---
+
 ## INSTRUCCIONES FINALES:
 
 1. **PROCESA TODOS LOS FRAGMENTOS**: El contexto contiene MÚLTIPLES documentos separados por "---". Debes analizarlos TODOS.
 2. **LISTA EXHAUSTIVA CON TEXTO**: Si un término aparece en múltiples fragmentos, lista TODOS los que tengan contenido textual útil.
 3. **FORMATO OBLIGATORIO**: Cada mención debe tener:
-   - Referencia: **[Documento: ... | Timestamp: ...]**
+   - Referencia: **[VIDEO / AUDIO: ... | Minuto: ...]**
    - Seguida INMEDIATAMENTE por: "texto literal entre comillas"
 4. **OMITE REFERENCIAS VACÍAS**: Si un fragmento solo tiene nombre de archivo sin texto útil, NO lo incluyas.
 5. Agrupa la información por temas, pero SIEMPRE con citas textuales completas.
@@ -1137,7 +1534,7 @@ def format_docs(docs):
             content = timestamp_header + content
         
         # Formatear con el título del documento y el contenido (ahora con timestamps)
-        formatted_docs.append(f"Documento: {doc_title}\n{content}")
+        formatted_docs.append(f"VIDEO / AUDIO: {doc_title}\n{content}")
     
     return "\n\n---\n\n".join(formatted_docs)
 
@@ -1147,8 +1544,8 @@ def colorize_citations(text: str) -> str:
     Colorea las citas bibliográficas con la paleta One Dark Pro y
     mejora el formato visual con estructura de reporte forense:
     - "texto citado" en AZUL #61AFEF con fuente Merriweather 18px
-    - [Documento: ... | Timestamp: ...] en VERDE #98C379 con fuente Merriweather 17px
-    - Timestamp: HH:MM:SS --> HH:MM:SS en ROJO #FF0000 con fuente Merriweather 17px
+    - [VIDEO / AUDIO: ... | Minuto: ...] en VERDE OSCURO #2E7D32 con fuente Merriweather 19px NEGRITA
+    - Minuto: HH:MM:SS --> HH:MM:SS en ROJO #FF0000 con fuente Merriweather 17px
     - Encabezados de sección en AMARILLO #E5C07B
     - Agrega separadores visuales y cajas de evidencia
     
@@ -1159,6 +1556,26 @@ def colorize_citations(text: str) -> str:
     # PRIMERO: Eliminar milisegundos de todos los timestamps en el texto
     # Patrón: HH:MM:SS,mmm -> HH:MM:SS
     text = re.sub(r'(\d{2}:\d{2}:\d{2}),\d{3}', r'\1', text)
+    
+    # NUEVO: Procesar encabezados ####**texto**
+    # Convertir a MAYÚSCULAS, NEGRILLA y AZUL con espacio antes y después
+    # Patrón: ####**cualquier texto**
+    header_level4_pattern = r'####\s*\*\*(.+?)\*\*'
+    
+    def format_header_level4(match):
+        content = match.group(1).strip()
+        # Convertir a MAYÚSCULAS
+        content_upper = content.upper()
+        # Usar clase CSS global .header-level-4 (Amarillo Intenso #FFD700, 26px)
+        # IMPORTANTE: Usar comillas SIMPLES para la clase para evitar conflicto con el regex de citas que busca comillas dobles
+        return f"\n\n<div class='header-level-4'>{content_upper}</div>\n\n"
+    
+    text = re.sub(
+        header_level4_pattern,
+        format_header_level4,
+        text,
+        flags=re.MULTILINE
+    )
     
     # 1. Primero colorear texto entre comillas (antes de introducir HTML de los documentos)
     # AZUL ONE DARK PRO: #61AFEF con fuente Merriweather 18px
@@ -1196,9 +1613,9 @@ def colorize_citations(text: str) -> str:
         flags=re.IGNORECASE
     )
     
-    # 3. LUEGO colorear los timestamps COMPLETOS (incluyendo "Timestamp:")
+    # 3. LUEGO colorear los timestamps COMPLETOS (incluyendo "Minuto:")
     # ROJO INTENSO: #FF0000
-    timestamp_pattern = r'(Timestamp:\s*\d{2}:\d{2}:\d{2}\s*-->\s*\d{2}:\d{2}:\d{2})'
+    timestamp_pattern = r'(Minuto:\s*\d{2}:\d{2}:\d{2}\s*-->\s*\d{2}:\d{2}:\d{2})'
     
     text = re.sub(
         timestamp_pattern,
@@ -1207,21 +1624,21 @@ def colorize_citations(text: str) -> str:
     )
     
     # 3. LUEGO colorear la parte del documento (hasta el |, sin incluir timestamp)
-    # VERDE ONE DARK PRO: #98C379
-    citation_pattern = r'(\*\*\[Documento:[^\|]+\|)'
+    # VERDE OSCURO INTENSO: #2E7D32 (Material Design Dark Green)
+    citation_pattern = r'(\*\*\[VIDEO / AUDIO:[^\|]+\|)'
     
     text = re.sub(
         citation_pattern,
-        lambda m: f'<span style="color: #98C379 !important; font-family: \'Merriweather\', serif !important; font-size: 17px !important; line-height: 1.2 !important; font-style: italic !important;">{m.group(1)}</span>',
+        lambda m: f'<span style="color: #2E7D32 !important; font-family: \'Merriweather\', serif !important; font-size: 19px !important; line-height: 1.3 !important; font-weight: bold !important;">{m.group(1)}</span>',
         text
     )
     
-    # 4. Colorear el cierre ]** en verde
+    # 4. Colorear el cierre ]** en verde oscuro
     closing_pattern = r'(\]\*\*)(?=\s|$|\n)'
     
     text = re.sub(
         closing_pattern,
-        lambda m: f'<span style="color: #98C379 !important;">{m.group(1)}</span>',
+        lambda m: f'<span style="color: #2E7D32 !important; font-weight: bold !important;">{m.group(1)}</span>',
         text
     )
     
@@ -1255,11 +1672,58 @@ def colorize_citations(text: str) -> str:
 
 
 
-# Header con logo
-col1, col2, col3 = st.columns([1, 2, 1])
-with col2:
-    st.image("assets/gerardfull.jpg", use_container_width=True)
-st.markdown('<div class="subtitle">v3.69 | ASISTENTE</div>', unsafe_allow_html=True)
+
+
+# Header con logo (Solo mostrar ANTES del login)
+if not st.session_state.get('user_name'):
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        st.image("assets/gerardfull.png", use_container_width=True)
+    st.markdown('<div class="subtitle">v3.69 | ASISTENTE</div>', unsafe_allow_html=True)
+
+# CSS Global para colorización de respuestas
+st.markdown("""
+<style>
+    /* Encabezados nivel 4 (####**texto**) en AMARILLO INTENSO */
+    .header-level-4 {
+        color: #FFD700 !important;
+        font-family: 'Merriweather', serif !important;
+        font-size: 26px !important;
+        font-weight: bold !important;
+        text-transform: uppercase !important;
+        text-align: center !important;
+        margin: 20px 0 !important;
+        padding: 10px 0 !important;
+        letter-spacing: 1px !important;
+        display: block !important;
+    }
+    
+    /* Asegurar que los colores inline se apliquen */
+    #respuesta-gerard span[style*="color"] {
+        /* Forzar aplicación de colores inline */
+    }
+    
+    /* Timestamps en ROJO */
+    #respuesta-gerard span[style*="#FF0000"] {
+        color: #FF0000 !important;
+    }
+    
+    /* Citas en AZUL */
+    #respuesta-gerard span[style*="#61AFEF"] {
+        color: #61AFEF !important;
+    }
+    
+    /* Documentos en VERDE OSCURO */
+    #respuesta-gerard span[style*="#2E7D32"] {
+        color: #2E7D32 !important;
+    }
+    
+    /* Encabezados en AMARILLO */
+    #respuesta-gerard span[style*="#E5C07B"] {
+        color: #E5C07B !important;
+    }
+</style>
+""", unsafe_allow_html=True)
 
 # IMPORTANTE: Inicializar recursos AL INICIO para descargar FAISS si es necesario
 # Esto asegura que el índice se descargue al cargar la app, no cuando alguien pregunta
@@ -1312,6 +1776,29 @@ if not st.session_state.get('user_name'):
 if 'user_name' not in st.session_state:
     st.session_state.user_name = ""
 
+# Campo de email del usuario (se llena con login de Google)
+if 'user_email' not in st.session_state:
+    st.session_state.user_email = ""
+
+# Inicializar flag de procesamiento OAuth (previene bucles infinitos)
+if 'oauth_processing' not in st.session_state:
+    st.session_state.oauth_processing = False
+if 'oauth_processed' not in st.session_state:
+    st.session_state.oauth_processed = False
+
+# Inicializar detector de IP (una sola vez por sesión)
+if 'geo_locator' not in st.session_state:
+    st.session_state.geo_locator = GeoLocator(timeout_seconds=3)
+    print("[INFO] GeoLocator inicializado")
+
+# Inicializar Google Sheets Logger (una sola vez por sesión)
+if 'sheets_logger' not in st.session_state:
+    st.session_state.sheets_logger = create_sheets_logger()
+    if st.session_state.sheets_logger:
+        print("[INFO] Google Sheets Logger inicializado")
+    else:
+        print("[WARNING] Google Sheets Logger no disponible - credenciales no encontradas")
+
 # Lógica de UI optimizada: Mostrar input de usuario ANTES de cargar recursos pesados
 if not st.session_state.user_name:
     col1, col2, col3 = st.columns([1, 2, 1])
@@ -1321,35 +1808,116 @@ if not st.session_state.user_name:
             st.markdown("### 🔐 Acceso Seguro")
             
             # Botón de Login con Google
-            # Detectar URL base para redirect
-            redirect_uri = "https://consultor-gerard-v3-bczzmyukdsww2clof4srcz.streamlit.app/"
-            login_url = auth_google.get_login_url(redirect_uri) 
+            # Detectar URL base para redirect (Estrategia robusta por SO)
+            # Local (Usuario) = Windows ('nt')
+            # Cloud (Streamlit) = Linux ('posix')
+            if os.name == 'nt':
+                redirect_uri = "http://localhost:8501/"
+                print("[INFO] Entorno detectado: LOCAL (Windows)")
+            else:
+                redirect_uri = "https://consultor-gerard-v2-zrg5ejmgryrttxhtxwqlxz.streamlit.app/"
+                print("[INFO] Entorno detectado: CLOUD (Linux/Otro)")
+            
+            print(f"[INFO] Usando redirect_uri: {redirect_uri}")
             
             # Verificar si volvemos de un redirect de Google
             query_params = st.query_params
-            if "code" in query_params:
+            
+            # PROTECCIÓN CONTRA BUCLES: Solo procesar si hay código Y no hemos procesado antes
+            if "code" in query_params and not st.session_state.oauth_processed:
+                print("[INFO] 🔐 Procesando callback de Google OAuth...")
                 code = query_params["code"]
-                st.query_params.clear()
+                
+                # Marcar inmediatamente como procesado ANTES de cualquier operación
+                st.session_state.oauth_processing = True
                 
                 with st.spinner("🔄 Verificando credenciales de Google..."):
                     user_info = auth_google.get_user_info(code, redirect_uri)
                     
                     if user_info:
+                        print(f"[INFO] ✅ Usuario autenticado: {user_info.get('name', 'Desconocido')}")
+                        print(f"[DEBUG] user_info completo: {user_info}")  # Ver qué contiene user_info
+                        
+                        # CRÍTICO: Guardar datos en session_state ANTES de limpiar query_params
                         st.session_state.user_name = user_info.get('name', 'Usuario Google')
                         st.session_state.user_email = user_info.get('email', '')
-                        # Para usuarios de Google, ciudad y país se detectarán automáticamente
-                        st.session_state.user_city = "Detectando..."
-                        st.session_state.user_country = "Detectando..."
-                        st.success(f"✅ ¡Bienvenido, {st.session_state.user_name}!")
-                        time.sleep(1)
-                        st.rerun()
+                        
+                        print(f"[DEBUG] Email capturado: '{st.session_state.user_email}'")  # Ver si se capturó
+                        
+                        # Función para validar si un string es una IP válida
+                        def is_valid_ip(ip_string):
+                            """Verifica si el string es una dirección IP válida (IPv4 o IPv6)"""
+                            if not ip_string or not isinstance(ip_string, str):
+                                return False
+                            # Si contiene espacios o letras que no sean en notación hex (IPv6), no es IP
+                            if ' ' in ip_string:
+                                return False
+                            # Verificar formato IPv4 o IPv6
+                            import re
+                            ipv4_pattern = r'^(\d{1,3}\.){3}\d{1,3}$'
+                            ipv6_pattern = r'^([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}$'
+                            return bool(re.match(ipv4_pattern, ip_string) or re.match(ipv6_pattern, ip_string))
+                        
+                        # Detectar ubicación (usará IP del proxy de Streamlit)
+                        # El usuario podrá confirmar su IP real después del login
+                        try:
+                            geo = st.session_state.geo_locator
+                            location = geo.get_location()
+                            
+                            if location and location.get('ciudad') != 'Desconocido':
+                                detected_ip = location.get('ip', 'No detectado')
+                                # VALIDACIÓN: Asegurar que la IP es válida y no es un nombre
+                                if is_valid_ip(detected_ip):
+                                    st.session_state.user_ip = detected_ip
+                                else:
+                                    print(f"[WARNING] IP inválida detectada: '{detected_ip}' - usando 'No detectado'")
+                                    st.session_state.user_ip = "No detectado"
+                                
+                                st.session_state.user_city = location.get('ciudad', 'Desconocida')
+                                st.session_state.user_country = location.get('pais', 'Desconocido')
+                                print(f"[INFO] 📍 Ubicación detectada: {st.session_state.user_city}, {st.session_state.user_country} (IP: {st.session_state.user_ip})")
+                            else:
+                                st.session_state.user_ip = "No detectado"
+                                st.session_state.user_city = "No detectada"
+                                st.session_state.user_country = "No detectado"
+                                
+                            # Marcar para confirmar IP real después
+                            st.session_state.ip_needs_confirmation = True
+                        except Exception as e:
+                            print(f"[WARNING] Error detectando ubicación: {e}")
+                            st.session_state.user_ip = "Error"
+                            st.session_state.user_city = "Error"
+                            st.session_state.user_country = "Error"
+                            st.session_state.ip_needs_confirmation = True
+                        
+                        # Marcar como procesado exitosamente
+                        st.session_state.oauth_processed = True
+                        st.session_state.oauth_processing = False
+                        
+                        # Verificar que user_name se guardó correctamente
+                        if st.session_state.user_name:
+                            print(f"[INFO] ✅ Session state actualizado: user_name={st.session_state.user_name}")
+                            
+                            # AHORA sí limpiar query_params (después de guardar todo)
+                            st.query_params.clear()
+                            
+                            st.success(f"✅ ¡Bienvenido, {st.session_state.user_name}!")
+                            time.sleep(1)
+                            st.rerun()
+                        else:
+                            print("[ERROR] ❌ No se pudo guardar user_name en session_state")
+                            st.session_state.oauth_processing = False
+                            st.error("❌ Error al guardar información de usuario.")
                     else:
+                        print("[ERROR] ❌ No se pudo obtener información del usuario de Google")
+                        st.session_state.oauth_processing = False
+                        st.session_state.oauth_processed = True  # Marcar para evitar reintentos
+                        st.query_params.clear()  # Limpiar para salir del bucle
                         st.error("❌ Error al iniciar sesión con Google.")
 
-            if login_url:
-                # DEBUG: Mostrar la URL generada para diagnóstico
-                st.info(f"🔍 DEBUG - URL de login generada: {login_url[:100]}...")
-                
+            # Mostrar botón de login solo si NO estamos procesando OAuth
+            login_url = auth_google.get_login_url(redirect_uri)
+            if login_url and not st.session_state.oauth_processing:
                 st.markdown(
                     f'''
                     <style>
@@ -1392,7 +1960,7 @@ if not st.session_state.user_name:
                     }}
                     </style>
                     
-                    <a href="{login_url}" target="_self" class="google-neo-button">
+                    <a href="{login_url}" class="google-neo-button">
                         <svg viewBox="0 0 24 24">
                             <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
                             <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
@@ -1405,114 +1973,154 @@ if not st.session_state.user_name:
                     unsafe_allow_html=True
                 )
             
-            st.markdown("--- O ---")
+            # Solo mostrar separador y formulario manual si está habilitado
+            if ENABLE_MANUAL_LOGIN:
+                st.markdown("--- O ---")
 
         # --- OPCIÓN 2: NOMBRE MANUAL ---
-        st.markdown("### ✍️ Ingreso Manual")
-        
-        # Lista de países más comunes (puede expandirse)
-        PAISES = [
-            "", "Afghanistan", "Albania", "Algeria", "Andorra", "Angola", "Argentina", "Armenia", "Australia", 
-            "Austria", "Azerbaijan", "Bahamas", "Bahrain", "Bangladesh", "Barbados", "Belarus", "Belgium", 
-            "Belize", "Benin", "Bhutan", "Bolivia", "Bosnia and Herzegovina", "Botswana", "Brazil", "Brunei", 
-            "Bulgaria", "Burkina Faso", "Burundi", "Cambodia", "Cameroon", "Canada", "Cape Verde", 
-            "Central African Republic", "Chad", "Chile", "China", "Colombia", "Comoros", "Congo", 
-            "Costa Rica", "Croatia", "Cuba", "Cyprus", "Czech Republic", "Denmark", "Djibouti", "Dominica", 
-            "Dominican Republic", "East Timor", "Ecuador", "Egypt", "El Salvador", "Equatorial Guinea", 
-            "Eritrea", "España", "Estonia", "Ethiopia", "Fiji", "Finland", "France", "Gabon", "Gambia", 
-            "Georgia", "Germany", "Ghana", "Greece", "Grenada", "Guatemala", "Guinea", "Guinea-Bissau", 
-            "Guyana", "Haiti", "Honduras", "Hungary", "Iceland", "India", "Indonesia", "Iran", "Iraq", 
-            "Ireland", "Israel", "Italy", "Ivory Coast", "Jamaica", "Japan", "Jordan", "Kazakhstan", 
-            "Kenya", "Kiribati", "North Korea", "South Korea", "Kuwait", "Kyrgyzstan", "Laos", "Latvia", 
-            "Lebanon", "Lesotho", "Liberia", "Libya", "Liechtenstein", "Lithuania", "Luxembourg", 
-            "Macedonia", "Madagascar", "Malawi", "Malaysia", "Maldives", "Mali", "Malta", "Marshall Islands", 
-            "Mauritania", "Mauritius", "Mexico", "Micronesia", "Moldova", "Monaco", "Mongolia", "Montenegro", 
-            "Morocco", "Mozambique", "Myanmar", "Namibia", "Nauru", "Nepal", "Netherlands", "New Zealand", 
-            "Nicaragua", "Niger", "Nigeria", "Norway", "Oman", "Pakistan", "Palau", "Panama", 
-            "Papua New Guinea", "Paraguay", "Peru", "Philippines", "Poland", "Portugal", "Qatar", 
-            "Romania", "Russia", "Rwanda", "Saint Kitts and Nevis", "Saint Lucia", 
-            "Saint Vincent and the Grenadines", "Samoa", "San Marino", "Sao Tome and Principe", 
-            "Saudi Arabia", "Senegal", "Serbia", "Seychelles", "Sierra Leone", "Singapore", "Slovakia", 
-            "Slovenia", "Solomon Islands", "Somalia", "South Africa", "South Sudan", "Spain", "Sri Lanka", 
-            "Sudan", "Suriname", "Swaziland", "Sweden", "Switzerland", "Syria", "Taiwan", "Tajikistan", 
-            "Tanzania", "Thailand", "Togo", "Tonga", "Trinidad and Tobago", "Tunisia", "Turkey", 
-            "Turkmenistan", "Tuvalu", "Uganda", "Ukraine", "United Arab Emirates", "United Kingdom", 
-            "United States", "Uruguay", "Uzbekistan", "Vanuatu", "Vatican City", "Venezuela", "Vietnam", 
-            "Yemen", "Zambia", "Zimbabwe"
-        ]
-        
-        # Usamos contenedores para organizar, pero SIN st.form para permitir interactividad
-        # Esto permite que al seleccionar país, se actualice la lista de ciudades
-        
-        temp_name = st.text_input(
-            "👤 Nombre completo:",
-            placeholder="Ej: Juan Pérez",
-            key="temp_user_name",
-            help="Escribe tu nombre completo"
-        )
-        
-        temp_country = st.selectbox(
-            "🌍 País:",
-            options=PAISES,
-            index=0,
-            key="temp_user_country",
-            help="Selecciona tu país de la lista"
-        )
-        
-        # Lógica dinámica para ciudad basada en el país
-        temp_city = ""
-        cities_list = get_cities_for_country(temp_country)
-        
-        if cities_list:
-            # Si hay ciudades para este país, mostrar dropdown
-            city_options = ["Seleccionar..."] + sorted(cities_list) + ["Otra ciudad..."]
-            selected_city_option = st.selectbox(
-                "🏙️ Ciudad:",
-                options=city_options,
-                key="temp_user_city_select",
-                help="Selecciona tu ciudad o elige 'Otra ciudad...' para escribirla"
-            )
+        if ENABLE_MANUAL_LOGIN:
+            st.markdown("### ✍️ Ingreso Manual")
             
-            if selected_city_option == "Otra ciudad...":
-                temp_city = st.text_input(
-                    "Escribe el nombre de tu ciudad:",
-                    placeholder="Ej: Mi Ciudad",
-                    key="temp_user_city_manual"
-                )
-            elif selected_city_option != "Seleccionar...":
-                temp_city = selected_city_option
-        else:
-            # Si no hay lista de ciudades (o no se seleccionó país), mostrar text input normal
-            temp_city = st.text_input(
-                "🏙️ Ciudad:",
-                placeholder="Ej: Madrid, Barcelona...",
-                key="temp_user_city_manual_fallback",
-                help="Escribe el nombre de tu ciudad"
+            # Lista de países más comunes (puede expandirse)
+            PAISES = [
+                "", "Afghanistan", "Albania", "Algeria", "Andorra", "Angola", "Argentina", "Armenia", "Australia", 
+                "Austria", "Azerbaijan", "Bahamas", "Bahrain", "Bangladesh", "Barbados", "Belarus", "Belgium", 
+                "Belize", "Benin", "Bhutan", "Bolivia", "Bosnia and Herzegovina", "Botswana", "Brazil", "Brunei", 
+                "Bulgaria", "Burkina Faso", "Burundi", "Cambodia", "Cameroon", "Canada", "Cape Verde", 
+                "Central African Republic", "Chad", "Chile", "China", "Colombia", "Comoros", "Congo", 
+                "Costa Rica", "Croatia", "Cuba", "Cyprus", "Czech Republic", "Denmark", "Djibouti", "Dominica", 
+                "Dominican Republic", "East Timor", "Ecuador", "Egypt", "El Salvador", "Equatorial Guinea", 
+                "Eritrea", "España", "Estonia", "Ethiopia", "Fiji", "Finland", "France", "Gabon", "Gambia", 
+                "Georgia", "Germany", "Ghana", "Greece", "Grenada", "Guatemala", "Guinea", "Guinea-Bissau", 
+                "Guyana", "Haiti", "Honduras", "Hungary", "Iceland", "India", "Indonesia", "Iran", "Iraq", 
+                "Ireland", "Israel", "Italy", "Ivory Coast", "Jamaica", "Japan", "Jordan", "Kazakhstan", 
+                "Kenya", "Kiribati", "North Korea", "South Korea", "Kuwait", "Kyrgyzstan", "Laos", "Latvia", 
+                "Lebanon", "Lesotho", "Liberia", "Libya", "Liechtenstein", "Lithuania", "Luxembourg", 
+                "Macedonia", "Madagascar", "Malawi", "Malaysia", "Maldives", "Mali", "Malta", "Marshall Islands", 
+                "Mauritania", "Mauritius", "Mexico", "Micronesia", "Moldova", "Monaco", "Mongolia", "Montenegro", 
+                "Morocco", "Mozambique", "Myanmar", "Namibia", "Nauru", "Nepal", "Netherlands", "New Zealand", 
+                "Nicaragua", "Niger", "Nigeria", "Norway", "Oman", "Pakistan", "Palau", "Panama", 
+                "Papua New Guinea", "Paraguay", "Peru", "Philippines", "Poland", "Portugal", "Qatar", 
+                "Romania", "Russia", "Rwanda", "Saint Kitts and Nevis", "Saint Lucia", 
+                "Saint Vincent and the Grenadines", "Samoa", "San Marino", "Sao Tome and Principe", 
+                "Saudi Arabia", "Senegal", "Serbia", "Seychelles", "Sierra Leone", "Singapore", "Slovakia", 
+                "Slovenia", "Solomon Islands", "Somalia", "South Africa", "South Sudan", "Spain", "Sri Lanka", 
+                "Sudan", "Suriname", "Swaziland", "Sweden", "Switzerland", "Syria", "Taiwan", "Tajikistan", 
+                "Tanzania", "Thailand", "Togo", "Tonga", "Trinidad and Tobago", "Tunisia", "Turkey", 
+                "Turkmenistan", "Tuvalu", "Uganda", "Ukraine", "United Arab Emirates", "United Kingdom", 
+                "United States", "Uruguay", "Uzbekistan", "Vanuatu", "Vatican City", "Venezuela", "Vietnam", 
+                "Yemen", "Zambia", "Zimbabwe"
+            ]
+        
+            # Usamos contenedores para organizar, pero SIN st.form para permitir interactividad
+            # Esto permite que al seleccionar país, se actualice la lista de ciudades
+        
+            temp_name = st.text_input(
+                "👤 Nombre completo:",
+                placeholder="Ej: Juan Pérez",
+                key="temp_user_name",
+                help="Escribe tu nombre completo"
             )
         
-        st.markdown("<br>", unsafe_allow_html=True)
-        submit_button = st.button("🚀 Continuar", use_container_width=True, key="manual_login_btn")
+            temp_country = st.selectbox(
+                "🌍 País:",
+                options=PAISES,
+                index=0,
+                key="temp_user_country",
+                help="Selecciona tu país de la lista"
+            )
         
-        if submit_button:
-            # Validar que todos los campos estén llenos
-            if not temp_name or not temp_name.strip():
-                st.error("❌ Por favor ingresa tu nombre")
-            elif not temp_country or temp_country == "":
-                st.error("❌ Por favor selecciona tu país de la lista")
-            elif not temp_city or not temp_city.strip():
-                st.error("❌ Por favor selecciona o ingresa tu ciudad")
-            # Validar que la ciudad sea un nombre válido (sin números)
-            elif not temp_city.replace(" ", "").replace("-", "").isalpha():
-                st.error("❌ El nombre de la ciudad no es válido. Solo debe contener letras, espacios y guiones")
-            elif len(temp_city.strip()) < 2:
-                st.error("❌ El nombre de la ciudad es demasiado corto")
+            # Lógica dinámica para ciudad basada en el país
+            temp_city = ""
+            cities_list = get_cities_for_country(temp_country)
+        
+            if cities_list:
+                # Si hay ciudades para este país, mostrar dropdown
+                city_options = ["Seleccionar..."] + sorted(cities_list) + ["Otra ciudad..."]
+                selected_city_option = st.selectbox(
+                    "🏙️ Ciudad:",
+                    options=city_options,
+                    key="temp_user_city_select",
+                    help="Selecciona tu ciudad o elige 'Otra ciudad...' para escribirla"
+                )
+            
+                if selected_city_option == "Otra ciudad...":
+                    temp_city = st.text_input(
+                        "Escribe el nombre de tu ciudad:",
+                        placeholder="Ej: Mi Ciudad",
+                        key="temp_user_city_manual"
+                    )
+                elif selected_city_option != "Seleccionar...":
+                    temp_city = selected_city_option
             else:
-                # Guardar datos en session_state
-                st.session_state.user_name = temp_name.strip()
-                st.session_state.user_city = temp_city.strip().title()  # Capitalizar correctamente
-                st.session_state.user_country = temp_country.strip()
-                st.success(f"✅ ¡Bienvenido, {temp_name.strip()}!")
-                st.rerun()
+                # Si no hay lista de ciudades (o no se seleccionó país), mostrar text input normal
+                temp_city = st.text_input(
+                    "🏙️ Ciudad:",
+                    placeholder="Ej: Madrid, Barcelona...",
+                    key="temp_user_city_manual_fallback",
+                    help="Escribe el nombre de tu ciudad"
+                )
+        
+            st.markdown("<br>", unsafe_allow_html=True)
+            submit_button = st.button("🚀 Continuar", use_container_width=True, key="manual_login_btn")
+        
+            if submit_button:
+                # Validar que todos los campos estén llenos
+                if not temp_name or not temp_name.strip():
+                    st.error("❌ Por favor ingresa tu nombre")
+                elif not temp_country or temp_country == "":
+                    st.error("❌ Por favor selecciona tu país de la lista")
+                elif not temp_city or not temp_city.strip():
+                    st.error("❌ Por favor selecciona o ingresa tu ciudad")
+                # Validar que la ciudad sea un nombre válido (sin números)
+                elif not temp_city.replace(" ", "").replace("-", "").isalpha():
+                    st.error("❌ El nombre de la ciudad no es válido. Solo debe contener letras, espacios y guiones")
+                elif len(temp_city.strip()) < 2:
+                    st.error("❌ El nombre de la ciudad es demasiado corto")
+                else:
+                    # Guardar datos en session_state
+                    st.session_state.user_name = temp_name.strip()
+                    st.session_state.user_city = temp_city.strip().title()  # Capitalizar correctamente
+                    st.session_state.user_country = temp_country.strip()
+                    
+                    # Función para validar si un string es una IP válida
+                    def is_valid_ip(ip_string):
+                        """Verifica si el string es una dirección IP válida (IPv4 o IPv6)"""
+                        if not ip_string or not isinstance(ip_string, str):
+                            return False
+                        if ' ' in ip_string:
+                            return False
+                        import re
+                        ipv4_pattern = r'^(\d{1,3}\.){3}\d{1,3}$'
+                        ipv6_pattern = r'^([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}$'
+                        return bool(re.match(ipv4_pattern, ip_string) or re.match(ipv6_pattern, ip_string))
+                    
+                    # Detectar ubicación/IP también para login manual
+                    try:
+                        geo = st.session_state.geo_locator
+                        location = geo.get_location()
+                        
+                        if location and location.get('ciudad') != 'Desconocido':
+                            detected_ip = location.get('ip', 'No detectado')
+                            # VALIDACIÓN: Asegurar que la IP es válida
+                            if is_valid_ip(detected_ip):
+                                st.session_state.user_ip = detected_ip
+                                print(f"[INFO] 📍 IP detectada para login manual: {st.session_state.user_ip}")
+                            else:
+                                print(f"[WARNING] IP inválida en login manual: '{detected_ip}' - usando 'No detectado'")
+                                st.session_state.user_ip = "No detectado"
+                        else:
+                            st.session_state.user_ip = "No detectado"
+                        
+                        # Marcar para confirmar IP real después
+                        st.session_state.ip_needs_confirmation = True
+                    except Exception as e:
+                        print(f"[WARNING] Error detectando IP en login manual: {e}")
+                        st.session_state.user_ip = "No detectado"
+                        st.session_state.ip_needs_confirmation = True
+                    
+                    st.success(f"✅ ¡Bienvenido, {temp_name.strip()}!")
+                    st.rerun()
     
     # Detener ejecución aquí si no hay usuario para que sea instantáneo
     if not st.session_state.user_name:
@@ -1520,12 +2128,39 @@ if not st.session_state.user_name:
 
 user_name = st.session_state.user_name
 
+# === CONFIRMACIÓN SIMPLE DE IP REAL ===
+# Muestra IP, copiar, pegar, confirmar - solución que SÍ funciona
+if st.session_state.get('ip_needs_confirmation', False):
+    st.warning("⚠️ Su IP no fue detectada automáticamente.")
+    st.info("Para continuar, necesitamos confirmar su IP.")
+    ip_input = st.text_input("Ingrese su IP pública (ej. 192.168.1.1):")
+    if st.button("Confirmar IP"):
+        if ip_input:
+            st.session_state['ip_needs_confirmation'] = False
+            st.session_state['user_ip'] = ip_input
+            st.rerun()
+        else:
+            st.error("Por favor, ingrese una IP válida.")
+    st.stop()
+
+
 # Cargar recursos SOLO después de tener usuario (o en background si fuera posible, pero Streamlit es secuencial)
 # Al moverlo aquí, la primera carga del input será instantánea.
 # La demora ocurrirá al dar Enter, pero mostraremos un spinner.
 with st.spinner("🚀 Iniciando sistemas neuronales..."):
     try:
         llm, faiss_vs = load_resources()
+        
+        # EXTRAER DOCUMENTOS PARA BM25 EN MEMORIA (Fuera del caché para que persista en session_state)
+        if 'all_docs' not in st.session_state or not st.session_state.all_docs:
+            try:
+                # Acceder al docstore de FAISS
+                all_docs = list(faiss_vs.docstore._dict.values())
+                st.session_state.all_docs = all_docs
+                print(f"[INFO] Documentos extraídos de FAISS para BM25: {len(all_docs)}")
+            except Exception as e:
+                print(f"[WARNING] No se pudieron extraer documentos de FAISS: {e}")
+                st.session_state.all_docs = []
         doc_count = faiss_vs.index.ntotal if hasattr(faiss_vs, 'index') else 0
         
         # Detectar si es un índice placeholder vacío
@@ -1561,26 +2196,800 @@ if 'conversation_history' not in st.session_state:
 if 'sheets_logger' not in st.session_state:
     st.session_state.sheets_logger = init_sheets_logger()
 
-# --- BARRA LATERAL: GUÍA DE USO ---
-# (Reemplaza al indicador de estado de Google Sheets)
+# --- BARRA LATERAL ---
+with st.sidebar:
+    # === LOGO/IMAGEN (PRIMERO) ===
+    import os
+    gestor_path = "assets/gestor.png"
+    if os.path.exists(gestor_path):
+        st.image(gestor_path, use_container_width=True)
+        st.markdown("---")
+    else:
+        print(f"[WARNING] Imagen no encontrada: {gestor_path}")
+    
+    # === GUÍA DE USO ===
+    with st.expander("📚 Guía de Uso", expanded=False):
+        try:
+            with open("GUIA_MODELOS_PREGUNTA_GERARD.md", "r", encoding="utf-8") as f:
+                guia_content = f.read()
+            
+            st.markdown(guia_content)
+            
+            # Botón para ver como página completa
+            if st.button("🔗 Ver Guía Completa", use_container_width=True, key="ver_guia_completa"):
+                st.session_state.show_guia_page = True
+                st.rerun()
+                
+        except Exception as e:
+            st.error(f"Error cargando la guía: {e}")
+    
+    st.markdown("---")
+    
+    # === INFORMACIÓN DEL USUARIO ===
+    st.markdown(f"### 👤 Usuario")
+    st.markdown(f"**{user_name}**")
+    if st.session_state.get('user_email'):
+        st.markdown(f"📧 {st.session_state.user_email}")
+    
+    st.markdown("---")
+    
+    # === BOTÓN CERRAR SESIÓN ===
+    if st.button("🚪 Cerrar Sesión", use_container_width=True, type="secondary"):
+        # Limpiar todos los datos de sesión
+        st.session_state.user_name = ""
+        st.session_state.user_email = ""
+        st.session_state.user_city = ""
+        st.session_state.user_country = ""
+        st.session_state.oauth_processed = False
+        st.session_state.oauth_processing = False
+        st.session_state.conversation_history = []
+        st.success("✅ Sesión cerrada exitosamente")
+        time.sleep(1)
+        st.rerun()
 
-with st.sidebar.expander("📚 Guía de Uso", expanded=False):
+
+
+
+# === MOSTRAR GUÍA COMO PÁGINA COMPLETA ===
+if st.session_state.get('show_guia_page', False):
+    st.markdown("# 📚 Guía de Uso Completa")
+    
+    if st.button("⬅️ Volver a la Aplicación", type="primary"):
+        st.session_state.show_guia_page = False
+        st.rerun()
+    
+    st.markdown("---")
+    
     try:
         with open("GUIA_MODELOS_PREGUNTA_GERARD.md", "r", encoding="utf-8") as f:
             guia_content = f.read()
-        
         st.markdown(guia_content)
-            
     except Exception as e:
         st.error(f"Error cargando la guía: {e}")
+    
+    st.stop()  # Detener ejecución para no mostrar el resto de la app
 
 
 # Inicializar flag para limpiar campo de pregunta
+# ═══════════════════════════════════════════════════════════════
+# FUNCIÓN DE VISUALIZACIÓN DE RESULTADOS (Refactorizada para persistencia)
+# ═══════════════════════════════════════════════════════════════
+def display_analysis_result(response, docs, search_time, search_method, relevant_docs_count, user_name):
+    # Ocultar animación de Data Scanning si está activa
+    st.components.v1.html("""
+    <script>
+        if (window.top && window.top.hideScanningAnimation) {
+            window.top.hideScanningAnimation();
+        }
+    </script>
+    """, height=0)
+    
+    # Mostrar respuesta
+    st.success("✅ Análisis completado")
+    
+    # Modal informando que la respuesta está lista
+    response_ready_modal = """
+    <script>
+    (function() {
+        // Inyectar modal de respuesta lista en el documento padre
+        function injectResponseReadyModal() {
+            const parentDoc = window.parent.document;
+            
+            // Verificar si ya existe el modal
+            if (parentDoc.getElementById('response-ready-modal')) {
+                return;
+            }
+            
+            // Inyectar estilos en el head del documento padre
+            const style = parentDoc.createElement('style');
+            style.textContent = `
+                #response-ready-modal {
+                    display: none;
+                    position: fixed;
+                    z-index: 9999999;
+                    left: 0;
+                    top: 0;
+                    width: 100%;
+                    height: 100%;
+                    background-color: rgba(0, 0, 0, 0.85);
+                    animation: responseModalFadeIn 0.3s;
+                    overflow: auto;
+                }
+                #response-ready-modal-content {
+                    background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+                    margin: 20% auto;
+                    padding: 35px;
+                    border: 3px solid #00d4ff;
+                    border-radius: 20px;
+                    width: 90%;
+                    max-width: 550px;
+                    box-shadow: 0 10px 40px rgba(0, 212, 255, 0.4);
+                    animation: responseModalSlideDown 0.5s;
+                    color: white;
+                    text-align: center;
+                }
+                #response-ready-modal h2 {
+                    color: #00ff41;
+                    margin-top: 0;
+                    font-size: 28px;
+                    margin-bottom: 20px;
+                }
+                #response-ready-modal p {
+                    font-size: 18px;
+                    line-height: 1.8;
+                    margin: 20px 0;
+                    color: #e0e0e0;
+                }
+                #response-ready-modal .highlight {
+                    color: #00d4ff;
+                    font-weight: bold;
+                    font-size: 20px;
+                }
+                #response-ready-modal-close {
+                    background: linear-gradient(45deg, #00d4ff, #0099cc);
+                    color: #000;
+                    border: none;
+                    padding: 15px 40px;
+                    border-radius: 10px;
+                    cursor: pointer;
+                    font-size: 18px;
+                    font-weight: bold;
+                    width: 100%;
+                    margin-top: 25px;
+                    transition: all 0.3s;
+                    box-shadow: 0 4px 15px rgba(0, 212, 255, 0.3);
+                }
+                #response-ready-modal-close:hover {
+                    transform: scale(1.05);
+                    box-shadow: 0 6px 20px rgba(0, 212, 255, 0.5);
+                }
+                @keyframes responseModalFadeIn {
+                    from { opacity: 0; }
+                    to { opacity: 1; }
+                }
+                @keyframes responseModalSlideDown {
+                    from { transform: translateY(-100px); opacity: 0; }
+                    to { transform: translateY(0); opacity: 1; }
+                }
+                @media (max-width: 600px) {
+                    #response-ready-modal-content {
+                        margin: 30% auto;
+                        padding: 25px;
+                        width: 90%;
+                    }
+                    #response-ready-modal h2 {
+                        font-size: 22px;
+                    }
+                    #response-ready-modal p {
+                        font-size: 16px;
+                    }
+                }
+            `;
+            parentDoc.head.appendChild(style);
+            
+            // Crear el modal en el body del documento padre
+            const modalDiv = parentDoc.createElement('div');
+            modalDiv.id = 'response-ready-modal';
+            modalDiv.innerHTML = `
+                <div id="response-ready-modal-content">
+                    <h2>🎉 ¡Respuesta Lista!</h2>
+                    <p>✨ Tu consulta ha sido procesada exitosamente</p>
+                    <p class="highlight">👇 Desliza hacia abajo para ver tu respuesta</p>
+                    <p style="font-size: 16px; color: #a0a0a0; margin-top: 15px;">💡 Usa scroll o desliza para navegar</p>
+                    <button id="response-ready-modal-close">VER RESPUESTA</button>
+                </div>
+            `;
+            parentDoc.body.appendChild(modalDiv);
+            
+            // Función para cerrar el modal de respuesta lista
+            window.closeResponseReadyModal = function() {
+                console.log('[Response Modal] Cerrando modal...');
+                const modal = parentDoc.getElementById('response-ready-modal');
+                if (modal) {
+                    modal.remove(); // Eliminar completamente del DOM
+                    console.log('[Response Modal] Modal eliminado');
+                    // Scroll automático a la respuesta después de cerrar
+                    setTimeout(function() {
+                        window.parent.scrollTo({
+                            top: document.body.scrollHeight,
+                            behavior: 'smooth'
+                        });
+                    }, 200);
+                }
+            };
+            
+            // Event listeners para el modal en el documento padre
+            const closeBtn = parentDoc.getElementById('response-ready-modal-close');
+            if (closeBtn) {
+                console.log('[Response Modal] Configurando event listeners...');
+                
+                // Estrategia 1: onclick inline (más confiable en móviles)
+                closeBtn.onclick = function(e) {
+                    console.log('[Response Modal] onclick disparado');
+                    e.preventDefault();
+                    e.stopPropagation();
+                    window.closeResponseReadyModal();
+                    return false;
+                };
+                
+                // Estrategia 2: addEventListener para click
+                closeBtn.addEventListener('click', function(e) {
+                    console.log('[Response Modal] click listener disparado');
+                    e.preventDefault();
+                    e.stopPropagation();
+                    window.closeResponseReadyModal();
+                }, { passive: false });
+                
+                // Estrategia 3: touchend para móviles
+                closeBtn.addEventListener('touchend', function(e) {
+                    console.log('[Response Modal] touchend listener disparado');
+                    e.preventDefault();
+                    e.stopPropagation();
+                    window.closeResponseReadyModal();
+                }, { passive: false });
+                
+                // Hacer el botón más accesible al touch
+                closeBtn.style.cursor = 'pointer';
+                closeBtn.style.userSelect = 'none';
+                closeBtn.style.webkitTapHighlightColor = 'transparent';
+            }
+            
+            // Cerrar al hacer click fuera del modal
+            const modal = parentDoc.getElementById('response-ready-modal');
+            if (modal) {
+                modal.addEventListener('click', function(event) {
+                    if (event.target.id === 'response-ready-modal') {
+                        console.log('[Response Modal] Click fuera del modal');
+                        window.closeResponseReadyModal();
+                    }
+                });
+            }
+        }
+        
+        function showResponseReadyModal() {
+            const parentDoc = window.parent.document;
+            const modal = parentDoc.getElementById('response-ready-modal');
+            if (modal) {
+                modal.style.display = 'block';
+            }
+        }
+        
+        // Inyectar y mostrar modal después de un breve delay
+        setTimeout(function() {
+            injectResponseReadyModal();
+            setTimeout(showResponseReadyModal, 300);
+        }, 100);
+    })();
+    </script>
+    """
+    st.components.v1.html(response_ready_modal, height=0)
+    
+    # Animación de globos lenta
+    st.balloons()
+    st.markdown("""
+    <style>
+        /* Ralentizar animación de globos (clase interna de Streamlit) */
+        div[data-testid="stBalloons"] > div > div {
+            animation-duration: 24s !important; /* 9X más lento (Muy lento) */
+        }
+    </style>
+    """, unsafe_allow_html=True)
+    
+    st.markdown("### 🔬 Resultado del Análisis:")
+    # Colorear las citas antes de mostrar
+    colored_response = colorize_citations(response)
+    # IMPORTANTE: Usar st.html() para renderizar HTML sin escapar (preserva todos los estilos)
+    st.html(f'<div class="response-container" id="respuesta-gerard">{colored_response}</div>')
+    
+    # BOTÓN LEER EN VOZ ALTA (TTS) - USANDO GOOGLE CLOUD TTS (SERVIDOR)
+    # Limpiar el texto para lectura (remover HTML, timestamps, etc.)
+    import re as regex
+    texto_para_leer = _strip_html_tags(response)
+    
+    # Remover referencias completas de VIDEO/AUDIO con sus citas
+    # Ejemplo: **[VIDEO / AUDIO: ... ]** "cita textual"
+    # Primero remover las referencias en corchetes
+    texto_para_leer = regex.sub(r'\*\*\[VIDEO\s*/\s*AUDIO:.*?\]\*\*', '', texto_para_leer, flags=regex.IGNORECASE | regex.DOTALL)
+    
+    # Remover líneas de citas que empiezan con * y tienen comillas
+    # Ejemplo: * "cita textual aquí"
+    texto_para_leer = regex.sub(r'\*\s*"[^"]*"', '', texto_para_leer)
+    
+    # Remover líneas que solo tienen asteriscos o puntos de lista
+    texto_para_leer = regex.sub(r'^\s*[\*\-]+\s*$', '', texto_para_leer, flags=regex.MULTILINE)
+    
+    # Remover timestamps como [00:00:00] o (00:00:00)
+    texto_para_leer = regex.sub(r'[\[\(]\d{1,2}:\d{2}(:\d{2})?[\]\)]', '', texto_para_leer)
+    
+    # Remover emojis para lectura más limpia
+    texto_para_leer = regex.sub(r'[🔴🟡🟢📺📻💬❌✅⚠️📄🎬📝🔍🎯👉🔹🔸⭐💡🧬🔬🚀📊📈🌟✨💎🙏💕❗‼️👀💥]', '', texto_para_leer)
+    
+    # Remover asteriscos (markdown de negrita e itálica)
+    texto_para_leer = texto_para_leer.replace('*', '')
+    
+    # Remover almohadillas (markdown de títulos)
+    texto_para_leer = texto_para_leer.replace('#', '')
+    
+    # Limpiar espacios múltiples y líneas vacías
+    texto_para_leer = regex.sub(r'\n\s*\n+', '\n\n', texto_para_leer)
+    texto_para_leer = regex.sub(r'  +', ' ', texto_para_leer)
+    
+    # Limitar longitud (Google TTS tiene límite de 5000 caracteres)
+    if len(texto_para_leer) > 4900:
+        texto_para_leer = texto_para_leer[:4900] + '... y más contenido.'
+    
+    # Mostrar botón TTS solo si el servicio está disponible
+    if TTS_AVAILABLE:
+        # Usar session_state para almacenar audio generado y evitar regenerar en cada rerun
+        tts_key = f"tts_audio_{hash(texto_para_leer[:100])}"
+        
+        tts_col1, tts_col2 = st.columns([1, 3])
+        with tts_col1:
+            generar_audio = st.button("🔊 Generar Audio", key="tts_generar_btn", type="primary", use_container_width=True)
+        
+        # Si el usuario hace clic en generar, crear el audio
+        if generar_audio:
+            # Mensaje personalizado más grande y de color verde neón
+            loading_msg = '<p style="color: #00ff41; font-size: 20px; font-weight: bold; text-shadow: 0 0 10px rgba(0, 255, 65, 0.5);">🎤 GERARD ESTA GENERANDO EL AUDIO RESUMEN...</p>'
+            with st.spinner(" "): # Spinner vacío para usar el nuestro debajo
+                st.markdown(loading_msg, unsafe_allow_html=True)
+                try:
+                    # Intentar generar audio y capturar posibles errores específicos
+                    audio_bytes, error_msg = synthesize_text_to_mp3(texto_para_leer, voice_name="es-US-Wavenet-B")
+                    
+                    if audio_bytes:
+                        st.session_state[tts_key] = audio_bytes
+                        st.success("✅ Audio generado correctamente")
+                    else:
+                        st.error(f"❌ Error al generar audio: {error_msg}")
+                        st.info("💡 Este error viene directamente de Google Cloud. Puede ser un problema de cuota, de la voz seleccionada o de permisos de la API.")
+                except Exception as e:
+                    error_detail = f"{type(e).__name__}: {str(e)}"
+                    st.error(f"❌ Error crítico en TTS: {error_detail}")
+                    st.info("💡 Verifica la configuración de la API y las credenciales.")
+        
+        # Mostrar reproductor si hay audio generado
+        if tts_key in st.session_state and st.session_state[tts_key]:
+            # Generar nombre del archivo de audio (igual que el PDF pero con "AUDIO" al inicio)
+            timestamp_str = datetime.now().strftime("%Y%m%d_%H%M")
+            safe_username = "".join(c for c in user_name if c.isalnum() or c in (' ', '_', '-')).strip().replace(' ', '_')
+            
+            # Construir nombre con TODAS las preguntas (igual que el PDF)
+            question_parts = []
+            for entry in st.session_state.conversation_history:
+                clean_q = "".join(c for c in entry["query"] if c.isalnum() or c in (' ', '_', '-', '?')).strip()
+                clean_q = clean_q.replace(' ', '_')
+                if clean_q:
+                    question_parts.append(clean_q)
+            
+            if question_parts:
+                questions_str = "_".join(f"{q}?" for q in question_parts)
+                audio_filename = f"AUDIO_CONSULTA_DE_{safe_username}_{questions_str}_{timestamp_str}.mp3"
+            else:
+                audio_filename = f"AUDIO_CONSULTA_DE_{safe_username}_{timestamp_str}.mp3"
+            
+            # Mostrar reproductor de audio robusto para iPhone usando HTML5 + Base64
+            audio_html = create_audio_html(st.session_state[tts_key])
+            st.components.v1.html(audio_html, height=160)
+            
+            # Botón de descarga de Audio Moderno con Modal Integrado
+            audio_b64 = base64.b64encode(st.session_state[tts_key]).decode()
+            audio_download_html = f"""
+            <script>
+            function downloadAudioWithModal() {{
+                try {{
+                    // Descargar el audio
+                    const byteCharacters = atob('{audio_b64}');
+                    const byteNumbers = new Array(byteCharacters.length);
+                    for (let i = 0; i < byteCharacters.length; i++) {{
+                        byteNumbers[i] = byteCharacters.charCodeAt(i);
+                    }}
+                    const byteArray = new Uint8Array(byteNumbers);
+                    const blob = new Blob([byteArray], {{type: 'audio/mpeg'}});
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = '{audio_filename}';
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                    URL.revokeObjectURL(url);
+                    
+                    // Mostrar modal
+                    setTimeout(function() {{
+                        const parentDoc = window.parent.document;
+                        
+                        // Eliminar modal anterior si existe
+                        const oldModal = parentDoc.getElementById('gerard-audio-modal');
+                        if (oldModal) oldModal.remove();
+                        
+                        // Crear modal
+                        const modal = parentDoc.createElement('div');
+                        modal.id = 'gerard-audio-modal';
+                        modal.innerHTML = `
+                            <style>
+                                #gerard-audio-modal {{
+                                    position: fixed;
+                                    top: 0;
+                                    left: 0;
+                                    width: 100%;
+                                    height: 100%;
+                                    background: rgba(10, 10, 15, 0.85);
+                                    backdrop-filter: blur(15px);
+                                    display: flex;
+                                    justify-content: center;
+                                    align-items: center;
+                                    z-index: 9999999;
+                                    animation: fadeIn 0.4s;
+                                }}
+                                @keyframes fadeIn {{ from {{ opacity: 0; }} to {{ opacity: 1; }} }}
+                                @keyframes slideUp {{ from {{ transform: translateY(50px); opacity: 0; }} to {{ transform: translateY(0); opacity: 1; }} }}
+                                @keyframes barWait {{ from {{ width: 100%; }} to {{ width: 0%; }} }}
+                            </style>
+                            <div style="background:linear-gradient(135deg,rgba(15,15,25,0.95),rgba(25,25,40,0.9));border:2px solid #00ff41;border-radius:24px;padding:40px;max-width:500px;width:90%;text-align:center;box-shadow:0 0 40px rgba(0,255,65,0.2);font-family:'Orbitron',sans-serif;color:white;position:relative;overflow:hidden;animation:slideUp 0.5s;">
+                                <div style="width:80px;height:80px;background:rgba(0,255,65,0.1);border:2px solid #00ff41;border-radius:50%;display:flex;justify-content:center;align-items:center;margin:0 auto 25px;box-shadow:0 0 20px rgba(0,255,65,0.4);">
+                                    <svg viewBox="0 0 24 24" style="width:40px;height:40px;fill:#00ff41;filter:drop-shadow(0 0 8px rgba(0,255,65,0.8));">
+                                        <path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41L9 16.17z"/>
+                                    </svg>
+                                </div>
+                                <div style="color:#00ff41;font-size:24px;font-weight:700;margin-bottom:20px;text-transform:uppercase;letter-spacing:2px;text-shadow:0 0 10px rgba(0,255,65,0.5);">✅ ¡AUDIO DESCARGADO!</div>
+                                <div style="color:#e0e0e0;font-size:16px;line-height:1.6;margin-bottom:30px;">🎙️ Tu audio resumen ha sido procesado y guardado exitosamente.</div>
+                                <button id="close-audio-modal-btn" style="background:linear-gradient(45deg,#00ff41,#00d4ff);color:#000;border:none;padding:15px 40px;border-radius:12px;font-size:18px;font-weight:700;text-transform:uppercase;letter-spacing:1px;cursor:pointer;box-shadow:0 0 15px rgba(0,255,65,0.4);width:100%;">ENTENDIDO</button>
+                                <div style="position:absolute;bottom:0;left:0;height:3px;background:#00ff41;width:100%;animation:barWait 5s linear forwards;"></div>
+                            </div>
+                        `;
+                        
+                        parentDoc.body.appendChild(modal);
+                        
+                        // Cerrar modal al hacer clic en el botón
+                        const closeBtn = parentDoc.getElementById('close-audio-modal-btn');
+                        if (closeBtn) {{
+                            closeBtn.onclick = function() {{ modal.remove(); }};
+                        }}
+                        
+                        // Cerrar al hacer clic fuera
+                        modal.onclick = function(e) {{
+                            if (e.target === modal) modal.remove();
+                        }};
+                        
+                        // Auto-cerrar después de 5 segundos
+                        setTimeout(function() {{ modal.remove(); }}, 5000);
+                    }}, 300);
+                    
+                }} catch (e) {{
+                    console.error('Error en descarga de audio:', e);
+                    alert('Error al descargar el audio. Por favor, intenta nuevamente.');
+                }}
+            }}
+            </script>
+            <button onclick="downloadAudioWithModal()" style="
+                background: linear-gradient(45deg, #00ff41, #00d4ff);
+                color: #000;
+                border: none;
+                padding: 12px 20px;
+                border-radius: 8px;
+                cursor: pointer;
+                font-size: 16px;
+                font-weight: bold;
+                width: 100%;
+                margin: 10px 0;
+                box-shadow: 0 4px 15px rgba(0, 255, 65, 0.3);
+                transition: all 0.3s;
+            ">⬇️ DESCARGAR AUDIO RESUMEN</button>
+            """
+            st.components.v1.html(audio_download_html, height=80)
+    else:
+        st.info("ℹ️ TTS no disponible. Instala google-cloud-texttospeech para habilitar lectura en voz alta.")
+    
+    # [NUEVO] Panel de Scores de Relevancia (Forensic Score Board)
+    with st.expander(f"🔍 Analizar Scores de Relevancia ({len(docs)} fragmentos)", expanded=False):
+        st.markdown("*Los scores indican la relevancia del fragmento. Mayor score = más relacionado con tu pregunta (0.0 - 1.0)*")
+        for i, doc in enumerate(docs):
+            # Obtener score (default 0.5 si no existe)
+            score = doc.metadata.get('relevance_score', 0.5)
+            
+            # Lógica de color semáforo
+            if score >= 0.95:
+                color = "#00ff41"  # Verde neón (Perfecto)
+                label = "🟢 EXACTO"
+            elif score >= 0.85:
+                color = "#FFFF00"  # Amarillo (Muy alto)
+                label = "🟡 MUY RELEVANTE"
+            elif score >= 0.70:
+                color = "#cccccc"  # Gris/Blanco (Relevante)
+                label = "⚪ RELEVANTE"
+            else:
+                color = "#ff4b4b"  # Rojo (Bajo)
+                label = "🔴 BAJA RELEVANCIA"
+            
+            source = doc.metadata.get('source', 'Desconocido')
+            # Limpiar source para mostrar solo nombre archivo
+            source_name = os.path.basename(source)
+            content_preview = doc.page_content[:200].replace("\n", " ") + "..."
+            
+            st.markdown(
+                f"""
+                <div style="background: rgba(255,255,255,0.05); padding: 10px; border-radius: 5px; margin-bottom: 8px; border-left: 3px solid {color};">
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <span style="font-weight: bold; color: {color}; font-family: monospace; font-size: 1.1em;">{label} ({score:.2f})</span>
+                        <span style="font-size: 0.8em; color: #888;">Rank #{i+1}</span>
+                    </div>
+                    <div style="font-size: 0.9em; color: #aaa; margin-top: 4px; font-weight: bold;">📄 {source_name}</div>
+                    <div style="font-size: 0.85em; color: #ccc; margin-top: 4px; font-style: italic;">"{content_preview}"</div>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+    
+    # Badge de método según el utilizado
+    method_badges = {
+        'hybrid': '🎯 Híbrido',
+        'faiss': '🔍 FAISS',
+        'bm25': '📝 BM25'
+    }
+    method_badge = method_badges.get(search_method, '❓ Desconocido')
+    
+    # Estadísticas
+    st.markdown(
+        f'<div class="stats">'
+        f'📊 Documentos analizados: {len(docs)} | '
+        f'👤 Usuario: {user_name.upper()} | '
+        f'🕐 Timestamp: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")} | '
+        f'⚡ Método: {method_badge}'
+        f'</div>',
+        unsafe_allow_html=True
+    )
+    
+    # SEGUNDO SCROLL: Automático hacia el final de la respuesta
+    scroll_placeholder_2 = st.empty()
+    scroll_placeholder_2.markdown(
+        """
+        <script>
+        (function() {
+            function forceScrollToBottom() {
+                try {
+                    window.scrollTo({
+                        top: document.body.scrollHeight,
+                        behavior: 'smooth'
+                    });
+                } catch(e) {
+                    console.error("Error en scroll final:", e);
+                }
+            }
+            setTimeout(forceScrollToBottom, 300);
+            setTimeout(forceScrollToBottom, 1000);
+        })();
+        </script>
+        """,
+        unsafe_allow_html=True
+    )
+    
+    # Botón de descarga PDF
+    if REPORTLAB_AVAILABLE and len(st.session_state.conversation_history) > 0:
+        st.markdown("---")
+        st.markdown("### 📥 Exportar Conversación")
+        
+        try:
+            # Construir HTML de toda la conversación
+            html_parts = []
+            for entry in st.session_state.conversation_history:
+                # Estilo específico solicitado para PDF: 
+                # MAYUSCULA, AZUL OSCURO, ARIAL, INCLINADA, SUBRAYADA, NEGRILLA, FUENTE NUMERO 22
+                html_parts.append(f'<p style="font-family: Arial, sans-serif; text-transform: uppercase; color: #00008B; font-style: italic; text-decoration: underline; font-weight: bold; font-size: 22pt; margin-bottom: 10px;">PREGUNTA ({entry["timestamp"]}):</p>')
+                html_parts.append(f'<p style="font-family: Arial, sans-serif; font-size: 14pt; margin-bottom: 20px; color: #333;">{entry["query"]}</p>')
+                html_parts.append(f'<p style="font-family: Arial, sans-serif; font-weight: bold; color: #2E7D32; font-size: 16pt; margin-top: 20px; margin-bottom: 10px;">RESPUESTA:</p>')
+                # Aplicar colorización a la respuesta antes de exportar
+                colored_response = colorize_citations(entry["response"])
+                html_parts.append(f'<p>{colored_response}</p>')
+                html_parts.append('<br/>')
+            
+            html_parts.append(f'<br/><p style="color: #28a745;">Usuario: {user_name.upper()}</p>')
+            html_full = ''.join(html_parts)
+            
+            # Generar PDF
+            pdf_bytes = generate_pdf_from_html_local(
+                html_full,
+                title_base=f"Consulta GERARD - {user_name.upper()}",
+                user_name=user_name.upper()
+            )
+            
+            # Nombre del archivo PDF
+            timestamp_str = datetime.now().strftime("%Y%m%d_%H%M")
+            safe_username = "".join(c for c in user_name if c.isalnum() or c in (' ', '_', '-')).strip().replace(' ', '_')
+            
+            # Construir nombre con TODAS las preguntas
+            question_parts = []
+            for entry in st.session_state.conversation_history:
+                clean_q = "".join(c for c in entry["query"] if c.isalnum() or c in (' ', '_', '-', '?')).strip()
+                clean_q = clean_q.replace(' ', '_')
+                if clean_q:
+                    question_parts.append(clean_q)
+            
+            if question_parts:
+                questions_str = "_".join(f"{q}?" for q in question_parts)
+                pdf_filename = f"CONSULTA_DE_{safe_username}_{questions_str}_{timestamp_str}.pdf"
+            else:
+                pdf_filename = f"CONSULTA_DE_{safe_username}_{timestamp_str}.pdf"
+            
+            # Convertir bytes a base64 para JavaScript
+            pdf_b64 = base64.b64encode(pdf_bytes).decode()
+            
+            # JavaScript para descarga con Modal Integrado
+            download_js_template = """
+            <script>
+            var pdfDownloaded = false;
+            
+            function downloadPDFWithModal() {
+                if (pdfDownloaded) return;
+                
+                const btn = document.getElementById('pdf-download-btn');
+                
+                try {
+                    // Descargar el PDF
+                    const byteCharacters = atob('PDF_B64_PLACEHOLDER');
+                    const byteNumbers = new Array(byteCharacters.length);
+                    for (let i = 0; i < byteCharacters.length; i++) {
+                        byteNumbers[i] = byteCharacters.charCodeAt(i);
+                    }
+                    const byteArray = new Uint8Array(byteNumbers);
+                    const blob = new Blob([byteArray], {type: 'application/pdf'});
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = 'PDF_FILENAME_PLACEHOLDER';
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                    URL.revokeObjectURL(url);
+                    
+                    // Cambiar botón a verde
+                    if (btn) {
+                        btn.style.background = 'linear-gradient(45deg, #00FF41, #00CC33)';
+                        btn.style.color = '#000';
+                        btn.innerHTML = '✅ ¡DESCARGADO!';
+                        pdfDownloaded = true;
+                    }
+                    
+                    // Mostrar modal
+                    setTimeout(function() {
+                        const parentDoc = window.parent.document;
+                        
+                        // Eliminar modal anterior si existe
+                        const oldModal = parentDoc.getElementById('gerard-pdf-modal');
+                        if (oldModal) oldModal.remove();
+                        
+                        // Crear modal
+                        const modal = parentDoc.createElement('div');
+                        modal.id = 'gerard-pdf-modal';
+                        modal.innerHTML = `
+                            <style>
+                                #gerard-pdf-modal {
+                                    position: fixed;
+                                    top: 0;
+                                    left: 0;
+                                    width: 100%;
+                                    height: 100%;
+                                    background: rgba(10, 10, 15, 0.85);
+                                    backdrop-filter: blur(15px);
+                                    display: flex;
+                                    justify-content: center;
+                                    align-items: center;
+                                    z-index: 9999999;
+                                    animation: fadeIn 0.4s;
+                                }
+                                @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+                                @keyframes slideUp { from { transform: translateY(50px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+                                @keyframes barWait { from { width: 100%; } to { width: 0%; } }
+                            </style>
+                            <div style="background:linear-gradient(135deg,rgba(15,15,25,0.95),rgba(25,25,40,0.9));border:2px solid #00ff41;border-radius:24px;padding:40px;max-width:500px;width:90%;text-align:center;box-shadow:0 0 40px rgba(0,255,65,0.2);font-family:'Orbitron',sans-serif;color:white;position:relative;overflow:hidden;animation:slideUp 0.5s;">
+                                <div style="width:80px;height:80px;background:rgba(0,255,65,0.1);border:2px solid #00ff41;border-radius:50%;display:flex;justify-content:center;align-items:center;margin:0 auto 25px;box-shadow:0 0 20px rgba(0,255,65,0.4);">
+                                    <svg viewBox="0 0 24 24" style="width:40px;height:40px;fill:#00ff41;filter:drop-shadow(0 0 8px rgba(0,255,65,0.8));">
+                                        <path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41L9 16.17z"/>
+                                    </svg>
+                                </div>
+                                <div style="color:#00ff41;font-size:24px;font-weight:700;margin-bottom:20px;text-transform:uppercase;letter-spacing:2px;text-shadow:0 0 10px rgba(0,255,65,0.5);">✅ ¡PDF DESCARGADO!</div>
+                                <div style="color:#e0e0e0;font-size:16px;line-height:1.6;margin-bottom:30px;">📄 Tu conversación completa ha sido exportada exitosamente en formato PDF.</div>
+                                <button id="close-pdf-modal-btn" style="background:linear-gradient(45deg,#00ff41,#00d4ff);color:#000;border:none;padding:15px 40px;border-radius:12px;font-size:18px;font-weight:700;text-transform:uppercase;letter-spacing:1px;cursor:pointer;box-shadow:0 0 15px rgba(0,255,65,0.4);width:100%;">ENTENDIDO</button>
+                                <div style="position:absolute;bottom:0;left:0;height:3px;background:#00ff41;width:100%;animation:barWait 5s linear forwards;"></div>
+                            </div>
+                        `;
+                        
+                        parentDoc.body.appendChild(modal);
+                        
+                        // Cerrar modal al hacer clic en el botón
+                        const closeBtn = parentDoc.getElementById('close-pdf-modal-btn');
+                        if (closeBtn) {
+                            closeBtn.onclick = function() { modal.remove(); };
+                        }
+                        
+                        // Cerrar al hacer clic fuera
+                        modal.onclick = function(e) {
+                            if (e.target === modal) modal.remove();
+                        };
+                        
+                        // Auto-cerrar después de 5 segundos
+                        setTimeout(function() { modal.remove(); }, 5000);
+                    }, 300);
+                    
+                } catch (e) {
+                    console.error('Error en descarga:', e);
+                    alert('Error al descargar el PDF. Por favor, intenta nuevamente.');
+                }
+            }
+            </script>
+            <button id="pdf-download-btn" onclick="downloadPDFWithModal()" style="
+                background: linear-gradient(45deg, #ff4b4b, #ff8080);
+                color: white;
+                border: none;
+                padding: 15px 20px;
+                border-radius: 12px;
+                cursor: pointer;
+                font-size: 18px;
+                font-weight: bold;
+                width: 100%;
+                margin: 20px 0;
+                box-shadow: 0 4px 15px rgba(255, 75, 75, 0.3);
+                transition: all 0.3s;
+                text-transform: uppercase;
+                letter-spacing: 1px;
+            ">📥 EXPORTAR CONVERSACIÓN COMPLETA (PDF)</button>
+            """
+            
+            # Reemplazar placeholders
+            download_html = download_js_template.replace('PDF_B64_PLACEHOLDER', pdf_b64).replace('PDF_FILENAME_PLACEHOLDER', pdf_filename)
+            st.components.v1.html(download_html, height=120)
+            
+        except Exception as e:
+            st.error(f"Error generando PDF: {e}")
+
+    # Botón Nueva Consulta
+    st.markdown("<br>", unsafe_allow_html=True)
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        if st.button("➕ NUEVA CONSULTA", key="new_query_btn_result", use_container_width=True):
+            # Resetear estados para nueva consulta (Limpieza TOTAL)
+            st.session_state.question_executed = False
+            st.session_state.trigger_search = False
+            st.session_state.last_executed_query = ""
+            st.session_state.clear_query = True
+            st.session_state.last_query = ""
+            
+            # Scroll to top
+            st.components.v1.html("""
+                <script>
+                window.parent.document.querySelector('.main').scrollTo({top: 0, behavior: 'smooth'});
+                </script>
+            """, height=0)
+            st.rerun()
+
 if 'clear_query' not in st.session_state:
     st.session_state.clear_query = False
 
 # Solo mostrar el resto SI hay nombre de usuario
 if user_name:
+    # Animación question.json DESHABILITADA - causaba bloqueos en la página
+    # Si se desea reactivar en el futuro, descomentar el código correspondiente
+    
     # Mensaje de bienvenida personalizado
     st.markdown(
         f'<div style="text-align: center; font-weight: bold; margin: 20px 0;">'
@@ -1614,6 +3023,27 @@ if user_name:
     
     # Campo de pregunta con auto-limpieza
     query_value = "" if st.session_state.clear_query else st.session_state.get('last_query', '')
+    
+    # CSS para estilizar el campo de pregunta
+    st.markdown("""
+    <style>
+        /* Estilizar el textarea de la pregunta */
+        div[data-testid="stTextArea"] textarea {
+            color: #00ff41 !important;
+            font-size: 18px !important;
+            font-weight: bold !important;
+            text-transform: uppercase !important;
+        }
+        
+        /* Estilizar el placeholder también */
+        div[data-testid="stTextArea"] textarea::placeholder {
+            color: #00ff41 !important;
+            opacity: 0.6 !important;
+            text-transform: uppercase !important;
+        }
+    </style>
+    """, unsafe_allow_html=True)
+    
     query = st.text_area(
         "🔍 Consulta de investigación:",
         value=query_value,
@@ -1622,13 +3052,480 @@ if user_name:
         key="query_input"
     )
     
+    # ============================================================================
+    # BOTÓN DE MICRÓFONO - Reconocimiento de voz
+    # ============================================================================
+    
+    # Inicializar estado del micrófono
+    if 'voice_text' not in st.session_state:
+        st.session_state.voice_text = ""
+    
+    # CSS para el botón de micrófono
+    st.markdown("""
+    <style>
+        /* Contenedor del micrófono con anillos */
+        .mic-container {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            margin: 15px 0;
+            position: relative;
+        }
+        
+        /* Anillos externos animados */
+        .mic-rings {
+            position: relative;
+            width: 100px;
+            height: 100px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        
+        .mic-rings::before,
+        .mic-rings::after {
+            content: '';
+            position: absolute;
+            border-radius: 50%;
+            border: 2px solid transparent;
+            animation: rotate-ring 3s linear infinite;
+        }
+        
+        .mic-rings::before {
+            width: 90px;
+            height: 90px;
+            border-top-color: #00ff41;
+            border-right-color: #00d4ff;
+            animation-duration: 2s;
+        }
+        
+        .mic-rings::after {
+            width: 100px;
+            height: 100px;
+            border-bottom-color: #ff00ff;
+            border-left-color: #00ff41;
+            animation-duration: 3s;
+            animation-direction: reverse;
+        }
+        
+        @keyframes rotate-ring {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        
+        /* Botón de micrófono - Glassmorphism moderno */
+        #mic-button {
+            background: linear-gradient(135deg, rgba(0, 255, 65, 0.15) 0%, rgba(0, 212, 255, 0.1) 50%, rgba(255, 0, 255, 0.1) 100%);
+            backdrop-filter: blur(10px);
+            -webkit-backdrop-filter: blur(10px);
+            border: 2px solid rgba(0, 255, 65, 0.6);
+            border-radius: 50%;
+            width: 70px;
+            height: 70px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+            box-shadow: 
+                0 0 20px rgba(0, 255, 65, 0.4),
+                0 0 40px rgba(0, 255, 65, 0.2),
+                inset 0 0 20px rgba(0, 255, 65, 0.1);
+            position: relative;
+            z-index: 10;
+        }
+        
+        #mic-button:hover {
+            transform: scale(1.15);
+            border-color: #00ff41;
+            box-shadow: 
+                0 0 30px rgba(0, 255, 65, 0.6),
+                0 0 60px rgba(0, 255, 65, 0.4),
+                0 0 90px rgba(0, 212, 255, 0.2),
+                inset 0 0 25px rgba(0, 255, 65, 0.2);
+        }
+        
+        #mic-button.recording {
+            background: linear-gradient(135deg, rgba(255, 75, 75, 0.3) 0%, rgba(255, 0, 100, 0.2) 100%);
+            border-color: #ff4b4b;
+            box-shadow: 
+                0 0 30px rgba(255, 75, 75, 0.7),
+                0 0 60px rgba(255, 75, 75, 0.4),
+                inset 0 0 20px rgba(255, 75, 75, 0.2);
+            animation: pulse-glow 1.5s ease-in-out infinite;
+        }
+        
+        .mic-rings.recording::before,
+        .mic-rings.recording::after {
+            border-color: transparent;
+            border-top-color: #ff4b4b;
+            border-bottom-color: #ff0066;
+            animation-duration: 0.8s;
+        }
+        
+        @keyframes pulse-glow {
+            0%, 100% { 
+                transform: scale(1); 
+                box-shadow: 0 0 30px rgba(255, 75, 75, 0.7), 0 0 60px rgba(255, 75, 75, 0.4);
+            }
+            50% { 
+                transform: scale(1.08); 
+                box-shadow: 0 0 50px rgba(255, 75, 75, 0.9), 0 0 80px rgba(255, 75, 75, 0.6);
+            }
+        }
+        
+        /* Icono del micrófono SVG moderno */
+        #mic-icon {
+            font-size: 32px;
+            filter: drop-shadow(0 0 8px rgba(0, 255, 65, 0.8));
+            transition: all 0.3s ease;
+        }
+        
+        #mic-button:hover #mic-icon {
+            filter: drop-shadow(0 0 15px rgba(0, 255, 65, 1));
+            transform: scale(1.1);
+        }
+        
+        #mic-button.recording #mic-icon {
+            filter: drop-shadow(0 0 15px rgba(255, 75, 75, 1));
+        }
+        
+        #mic-status {
+            text-align: center;
+            font-size: 1.1em;
+            color: #00ff41;
+            margin-top: 8px;
+            min-height: 25px;
+            font-weight: bold;
+            text-shadow: 0 0 10px rgba(0, 255, 65, 0.5);
+        }
+        
+        #mic-status.error {
+            color: #ff4b4b;
+        }
+    </style>
+    """, unsafe_allow_html=True)
+    
+    # JavaScript para reconocimiento de voz con Web Speech API
+    voice_recognition_html = """
+    <style>
+        .mic-container {
+            display: flex !important;
+            flex-direction: column !important;
+            align-items: center !important;
+            margin: 15px 0 !important;
+            position: relative !important;
+        }
+        
+        /* Anillos externos animados */
+        .mic-rings {
+            position: relative !important;
+            width: 100px !important;
+            height: 100px !important;
+            display: flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+        }
+        
+        .mic-rings::before,
+        .mic-rings::after {
+            content: '' !important;
+            position: absolute !important;
+            border-radius: 50% !important;
+            border: 2px solid transparent !important;
+            animation: rotate-ring 3s linear infinite !important;
+        }
+        
+        .mic-rings::before {
+            width: 90px !important;
+            height: 90px !important;
+            border-top-color: #00ff41 !important;
+            border-right-color: #00d4ff !important;
+            animation-duration: 2s !important;
+        }
+        
+        .mic-rings::after {
+            width: 100px !important;
+            height: 100px !important;
+            border-bottom-color: #ff00ff !important;
+            border-left-color: #00ff41 !important;
+            animation-duration: 3s !important;
+            animation-direction: reverse !important;
+        }
+        
+        @keyframes rotate-ring {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        
+        .mic-rings.recording::before,
+        .mic-rings.recording::after {
+            border-color: transparent !important;
+            border-top-color: #ff4b4b !important;
+            border-bottom-color: #ff0066 !important;
+            animation-duration: 0.8s !important;
+        }
+        
+        /* Botón glassmorphism */
+        #mic-button {
+            background: linear-gradient(135deg, rgba(0, 255, 65, 0.15) 0%, rgba(0, 212, 255, 0.1) 50%, rgba(255, 0, 255, 0.1) 100%) !important;
+            backdrop-filter: blur(10px) !important;
+            -webkit-backdrop-filter: blur(10px) !important;
+            border: 2px solid rgba(0, 255, 65, 0.6) !important;
+            border-radius: 50% !important;
+            width: 70px !important;
+            height: 70px !important;
+            cursor: pointer !important;
+            display: flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+            transition: all 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275) !important;
+            box-shadow: 0 0 20px rgba(0, 255, 65, 0.4), 0 0 40px rgba(0, 255, 65, 0.2), inset 0 0 20px rgba(0, 255, 65, 0.1) !important;
+            position: relative !important;
+            z-index: 10 !important;
+        }
+        
+        #mic-button:hover {
+            transform: scale(1.15) !important;
+            border-color: #00ff41 !important;
+            box-shadow: 0 0 30px rgba(0, 255, 65, 0.6), 0 0 60px rgba(0, 255, 65, 0.4), 0 0 90px rgba(0, 212, 255, 0.2) !important;
+        }
+        
+        #mic-button.recording {
+            background: linear-gradient(135deg, rgba(255, 75, 75, 0.3) 0%, rgba(255, 0, 100, 0.2) 100%) !important;
+            border-color: #ff4b4b !important;
+            box-shadow: 0 0 30px rgba(255, 75, 75, 0.7), 0 0 60px rgba(255, 75, 75, 0.4) !important;
+            animation: pulse-glow 1.5s ease-in-out infinite !important;
+        }
+        
+        @keyframes pulse-glow {
+            0%, 100% { transform: scale(1); box-shadow: 0 0 30px rgba(255, 75, 75, 0.7), 0 0 60px rgba(255, 75, 75, 0.4); }
+            50% { transform: scale(1.08); box-shadow: 0 0 50px rgba(255, 75, 75, 0.9), 0 0 80px rgba(255, 75, 75, 0.6); }
+        }
+        
+        #mic-icon {
+            font-size: 32px !important;
+            filter: drop-shadow(0 0 8px rgba(0, 255, 65, 0.8)) !important;
+            transition: all 0.3s ease !important;
+        }
+        
+        #mic-button.recording #mic-icon {
+            filter: drop-shadow(0 0 15px rgba(255, 75, 75, 1)) !important;
+        }
+        
+        #mic-status {
+            text-align: center !important;
+            font-size: 1.2em !important;
+            color: #00ff41 !important;
+            margin-top: 12px !important;
+            min-height: 30px !important;
+            font-weight: bold !important;
+            text-shadow: 0 0 15px rgba(0, 255, 65, 0.7) !important;
+            background: transparent !important;
+        }
+        
+        #mic-status.error {
+            color: #ff4b4b !important;
+            text-shadow: 0 0 15px rgba(255, 75, 75, 0.7) !important;
+        }
+    </style>
+    <div class="mic-container">
+        <div class="mic-rings" id="mic-rings">
+            <button id="mic-button" onclick="toggleRecording()" title="Haz clic para hablar tu pregunta">
+                <span id="mic-icon">🎤</span>
+            </button>
+        </div>
+        <div id="mic-status">🎙️ Toca el micrófono para preguntar con voz</div>
+    </div>
+    
+    <script>
+        let recognition = null;
+        let isRecording = false;
+        let fullTranscript = '';  // Almacenar transcripción completa
+        
+        // Verificar soporte de Web Speech API
+        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+        
+        if (SpeechRecognition) {
+            recognition = new SpeechRecognition();
+            recognition.continuous = false;  // CAMBIO: Solo una frase, no continuo
+            recognition.interimResults = true;  // Mantener para mostrar progreso visual
+            recognition.lang = 'es-ES'; // Español
+            recognition.maxAlternatives = 1;
+            
+            recognition.onstart = function() {
+                isRecording = true;
+                fullTranscript = '';  // Resetear al iniciar
+                document.getElementById('mic-button').classList.add('recording');
+                document.getElementById('mic-rings').classList.add('recording');
+                document.getElementById('mic-icon').textContent = '🔴';
+                document.getElementById('mic-status').textContent = '🎙️ Escuchando... Habla ahora';
+                document.getElementById('mic-status').classList.remove('error');
+            };
+            
+            recognition.onend = function() {
+                isRecording = false;
+                document.getElementById('mic-button').classList.remove('recording');
+                document.getElementById('mic-rings').classList.remove('recording');
+                document.getElementById('mic-icon').textContent = '🎤';
+                
+                // Si tenemos texto final, insertarlo ahora
+                if (fullTranscript) {
+                    insertTextIntoTextarea(fullTranscript);
+                    document.getElementById('mic-status').textContent = '✅ Listo: ' + fullTranscript.substring(0, 40) + (fullTranscript.length > 40 ? '...' : '');
+                } else if (!document.getElementById('mic-status').classList.contains('error')) {
+                    document.getElementById('mic-status').textContent = 'Haz clic para hablar de nuevo';
+                }
+            };
+            
+            recognition.onresult = function(event) {
+                // Construir la transcripción completa desde todos los resultados
+                let interimTranscript = '';
+                fullTranscript = '';  // Resetear para reconstruir
+                
+                for (let i = 0; i < event.results.length; i++) {
+                    const transcript = event.results[i][0].transcript;
+                    if (event.results[i].isFinal) {
+                        fullTranscript += transcript;
+                    } else {
+                        interimTranscript += transcript;
+                    }
+                }
+                
+                // Mostrar progreso mientras habla
+                const displayText = fullTranscript || interimTranscript;
+                if (displayText) {
+                    document.getElementById('mic-status').textContent = '📝 ' + displayText.toUpperCase();
+                }
+            };
+            
+            // Función para insertar texto en el textarea de Streamlit
+            function insertTextIntoTextarea(text) {
+                try {
+                    const parentDoc = window.parent.document;
+                    const newValue = text.toUpperCase();
+                    
+                    // 1. Actualizar el textarea principal de consulta
+                    const textareas = parentDoc.querySelectorAll('textarea');
+                    for (let textarea of textareas) {
+                        if (textarea.placeholder && (
+                            textarea.placeholder.includes('CONSULTA') || 
+                            textarea.placeholder.includes('información') ||
+                            textarea.placeholder.includes('DIGITA')
+                        )) {
+                            const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
+                            nativeInputValueSetter.call(textarea, newValue);
+                            
+                            const inputEvent = new Event('input', { bubbles: true });
+                            textarea.dispatchEvent(inputEvent);
+                            
+                            const changeEvent = new Event('change', { bubbles: true });
+                            textarea.dispatchEvent(changeEvent);
+                            break;
+                        }
+                    }
+                    
+                    // 2. IMPORTANTE: También actualizar el campo de voz oculto (voice_input_field)
+                    // Buscar por placeholder que contiene "micrófono"
+                    const allInputs = parentDoc.querySelectorAll('input[type="text"]');
+                    for (let input of allInputs) {
+                        if (input.placeholder && input.placeholder.includes('micrófono')) {
+                            const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                            nativeInputValueSetter.call(input, newValue);
+                            
+                            const inputEvent = new Event('input', { bubbles: true });
+                            input.dispatchEvent(inputEvent);
+                            
+                            const changeEvent = new Event('change', { bubbles: true });
+                            input.dispatchEvent(changeEvent);
+                            
+                            // También simular blur para forzar actualización de Streamlit
+                            const blurEvent = new Event('blur', { bubbles: true });
+                            input.dispatchEvent(blurEvent);
+                            break;
+                        }
+                    }
+                    
+                    // 3. CLAVE: Guardar en variable global para que streamlit_js_eval pueda leerlo
+                    window.top.voiceTranscript = newValue;
+                    console.log('[VOZ] Texto guardado en window.top.voiceTranscript:', newValue);
+                    
+                    // 4. NUEVO: Copiar automáticamente al portapapeles
+                    if (navigator.clipboard && newValue) {
+                        navigator.clipboard.writeText(newValue).then(function() {
+                            console.log('[VOZ] ✅ Texto copiado al portapapeles');
+                            document.getElementById('mic-status').innerHTML = 
+                                '📋 <span style="color: #00ff41;">¡COPIADO!</span> Pega (Ctrl+V) en el campo de consulta ➡️ ' + 
+                                '<br><em style="font-size: 0.9em;">"' + newValue.substring(0, 60) + (newValue.length > 60 ? '...' : '') + '"</em>';
+                        }).catch(function(err) {
+                            console.error('[VOZ] Error al copiar:', err);
+                        });
+                    }
+                    
+                } catch (e) {
+                    console.error('Error insertando texto:', e);
+                }
+            }
+            
+            recognition.onerror = function(event) {
+                console.error('Error de reconocimiento:', event.error);
+                document.getElementById('mic-status').classList.add('error');
+                
+                if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
+                    document.getElementById('mic-status').textContent = '❌ Permiso de micrófono denegado. Habilítalo en la configuración del navegador.';
+                } else if (event.error === 'no-speech') {
+                    document.getElementById('mic-status').textContent = '⚠️ No se detectó voz. Intenta de nuevo.';
+                    document.getElementById('mic-status').classList.remove('error');
+                } else if (event.error === 'network') {
+                    document.getElementById('mic-status').textContent = '❌ Error de red. Verifica tu conexión.';
+                } else {
+                    document.getElementById('mic-status').textContent = '❌ Error: ' + event.error;
+                }
+                
+                isRecording = false;
+                document.getElementById('mic-button').classList.remove('recording');
+                document.getElementById('mic-icon').textContent = '🎤';
+            };
+        } else {
+            document.getElementById('mic-status').textContent = '❌ Tu navegador no soporta reconocimiento de voz';
+            document.getElementById('mic-status').classList.add('error');
+            document.getElementById('mic-button').style.opacity = '0.5';
+            document.getElementById('mic-button').style.cursor = 'not-allowed';
+        }
+        
+        function toggleRecording() {
+            if (!recognition) {
+                alert('Tu navegador no soporta reconocimiento de voz. Usa Chrome, Edge o Safari.');
+                return;
+            }
+            
+            if (isRecording) {
+                recognition.stop();
+            } else {
+                try {
+                    recognition.start();
+                } catch (e) {
+                    console.error('Error al iniciar reconocimiento:', e);
+                    document.getElementById('mic-status').textContent = '⚠️ Haz clic de nuevo para reintentar';
+                }
+            }
+        }
+    </script>
+    """
+    
+    # Renderizar componente de voz (height=220 para acomodar texto en móviles)
+    st.components.v1.html(voice_recognition_html, height=220)
+    
+    # Mensaje informativo sobre cómo usar el texto copiado
+    # (El micrófono ya copia automáticamente al portapapeles)
+    
     # Checkbox de búsqueda exhaustiva
     col_checkbox, col_info = st.columns([1, 3])
     with col_checkbox:
         exhaustive_search = st.checkbox(
             "🔬 Exhaustiva", 
             value=st.session_state.get('exhaustive_search', False),
-            help="Activa búsqueda exhaustiva (recupera hasta 200 documentos en lugar del modo adaptativo)"
+            help="Activa búsqueda exhaustiva (recupera hasta 400 documentos en lugar del modo adaptativo)"
         )
         # Guardar estado
         st.session_state.exhaustive_search = exhaustive_search
@@ -1636,7 +3533,7 @@ if user_name:
     with col_info:
         if exhaustive_search:
             st.markdown(
-                '<div style="color: #00ff41; font-size: 0.9em; padding: 5px;">⚡ Modo exhaustivo: se recuperarán 200 documentos (~+2s tiempo)</div>',
+                '<div style="color: #00ff41; font-size: 0.9em; padding: 5px;">⚡ Modo exhaustivo: se recuperarán 400 documentos (~+2s tiempo)</div>',
                 unsafe_allow_html=True
             )
     
@@ -1644,65 +3541,176 @@ if user_name:
     if st.session_state.clear_query:
         st.session_state.clear_query = False
     
+    # Inicializar estado de ejecución si no existe
+    if 'question_executed' not in st.session_state:
+        st.session_state.question_executed = False
+        st.session_state.last_executed_query = ""
+
+    # Inicializar trigger de búsqueda diferida (para permitir rerun inmediato)
+    if 'trigger_search' not in st.session_state:
+        st.session_state.trigger_search = False
+    
+    # RESET AUTOMÁTICO: Si la consulta cambia, volver a estado normal
+    # Comparamos la consulta actual con la última ejecutada
+    # IMPORTANTE: NO resetear si trigger_search está activo (búsqueda en progreso)
+    # El trigger_search solo debe resetearse DESPUÉS de ejecutar la búsqueda, no antes
+    if not st.session_state.get('trigger_search', False):
+        if query != st.session_state.get('last_executed_query', ''):
+            st.session_state.question_executed = False
+
+    
+    # Determinar texto y marcador del botón
+    button_label = "🚀 EJECUTAR PREGUNTA"
+    
     # Botón de consulta centrado
     # Usamos columnas vacías a los lados para centrar el botón
     col_left, col_center, col_right = st.columns([1, 2, 1])
     with col_center:
-        search_button = st.button("🚀 EJECUTAR PREGUNTA", use_container_width=True)
+        # Si ya se ejecutó, inyectamos el marcador invisible que activa el CSS rojo
+        if st.session_state.question_executed:
+            st.markdown('<div class="executed-marker" style="display:none;"></div>', unsafe_allow_html=True)
+            button_label = "🔴 PREGUNTA EJECUTADA"
+            
+        search_button = st.button(button_label, use_container_width=True)
+        
+        # Si se presiona el botón:
+        # 1. Cambiar estado visual a ROJO inmediatamente
+        # 2. Activar trigger de búsqueda para la siguiente recarga
+        # 3. Recargar la página (RERUN) para mostrar el botón rojo ANTES de procesar
+        if search_button:
+            st.session_state.question_executed = True
+            # IMPORTANTE: Si query está vacío (caso micrófono), usar voice_transcript
+            effective_query = query if query.strip() else st.session_state.get('voice_transcript', '')
+            st.session_state.last_executed_query = effective_query
+            st.session_state.trigger_search = True
+            st.rerun()
     
-    # Procesar consulta
-    if search_button and query:
-        # Mostrar GIF de búsqueda
-        st.markdown('<div class="gif-container">', unsafe_allow_html=True)
-        if os.path.exists("assets/ovni.gif"):
-            st.image("assets/ovni.gif", width=300)
-        st.markdown('</div>', unsafe_allow_html=True)
+    # Procesar consulta (Si se activó el trigger en la recarga anterior)
+    # IMPORTANTE: Usamos last_executed_query porque después del rerun, el textarea
+    # podría estar vacío (especialmente cuando se usa el micrófono con JavaScript)
+    query_to_process = st.session_state.get('last_executed_query', '')
+    
+    if st.session_state.trigger_search and query_to_process:
+        # Desactivar trigger para evitar bucles, pero mantenemos question_executed
+        st.session_state.trigger_search = False
+        
+        # Cargar y mostrar animación Data Scanning
+        import json
+        import os
+        
+        data_scanning_path = os.path.join("assets", "Data Scanning.json")
+        try:
+            with open(data_scanning_path, 'r', encoding='utf-8') as f:
+                scanning_animation_data = json.load(f)
+        except Exception as e:
+            print(f"[ERROR] Error cargando Data Scanning.json: {e}")
+            scanning_animation_data = {}
+        
+        # Inyectar animación Data Scanning overlay
+        if scanning_animation_data:
+            scanning_injector_html = f"""
+            <!DOCTYPE html>
+            <html>
+            <body>
+                <script src="https://cdnjs.cloudflare.com/ajax/libs/bodymovin/5.12.2/lottie.min.js"></script>
+                <script>
+                    (function() {{
+                        const animationData = {json.dumps(scanning_animation_data)};
+                        let scanningAnimation = null;
+                        
+                        function injectScanningOverlay() {{
+                            if (typeof lottie === 'undefined') {{
+                                setTimeout(injectScanningOverlay, 100);
+                                return;
+                            }}
+                            
+                            const targetDoc = window.top.document;
+                            
+                            // Limpiar overlay anterior si existe
+                            const oldOverlay = targetDoc.getElementById('scanning-overlay');
+                            if (oldOverlay) {{
+                                oldOverlay.remove();
+                            }}
+                            
+                            const overlay = targetDoc.createElement('div');
+                            overlay.id = 'scanning-overlay';
+                            overlay.style.cssText = `
+                                display: flex;
+                                position: fixed;
+                                top: 0;
+                                left: 0;
+                                width: 100vw;
+                                height: 100vh;
+                                background: rgba(0, 0, 0, 0.5);
+                                z-index: 999999;
+                                justify-content: center;
+                                align-items: center;
+                                pointer-events: none;
+                                touch-action: auto;
+                                overflow: hidden;
+                            `;
+                            
+                            const container = targetDoc.createElement('div');
+                            container.id = 'scanning-container';
+                            container.style.cssText = `
+                                width: 400px;
+                                height: 400px;
+                                pointer-events: none;
+                            `;
+                            
+                            overlay.appendChild(container);
+                            targetDoc.body.appendChild(overlay);
+                            
+                            try {{
+                                scanningAnimation = lottie.loadAnimation({{
+                                    container: container,
+                                    renderer: 'svg',
+                                    loop: true,
+                                    autoplay: true,
+                                    animationData: animationData
+                                }});
+                                
+                                // Función global para ocultar la animación
+                                window.top.hideScanningAnimation = function() {{
+                                    const ovl = targetDoc.getElementById('scanning-overlay');
+                                    if (ovl) {{
+                                        ovl.remove();
+                                    }}
+                                }};
+                                
+                            }} catch (error) {{
+                                console.error('[ERROR] Error con animación scanning:', error);
+                            }}
+                        }}
+                        
+                        setTimeout(injectScanningOverlay, 100);
+                    }})();
+                </script>
+            </body>
+            </html>
+            """
+            
+            st.components.v1.html(scanning_injector_html, height=0)
+        
+        # Mostrar GIF de búsqueda (opcional, puedes comentar esto si solo quieres la animación Lottie)
+        # st.markdown('<div class="gif-container">', unsafe_allow_html=True)
+        # if os.path.exists("assets/ovni.gif"):
+        #     st.image("assets/ovni.gif", width=300)
+        # st.markdown('</div>', unsafe_allow_html=True)
         
         st.info(f"🔄 Procesando consulta de **{user_name.upper()}**...")
         
         # PRIMER SCROLL: Hacia el spinner (30% de la página)
-        # PRIMER SCROLL: Hacia el spinner para mostrar actividad
-        # SOLUCIÓN RADICAL: Inyectar script directamente en el DOM usando st.markdown
-        # Esto evita el problema del iframe aislado de components.html
-        
         scroll_placeholder_1 = st.empty()
         scroll_placeholder_1.markdown(
             """
             <script>
             (function() {
-                // Ejecutar inmediatamente sin timeout para asegurar que se ejecuta
                 try {
-                    // Lista de posibles contenedores scrollables en Streamlit
-                    const scrollTargets = [
-                        document.querySelector('.main'),
-                        document.querySelector('[data-testid="stAppViewContainer"]'),
-                        document.querySelector('.stApp'),
-                        document.documentElement, // html
-                        document.body
-                    ];
-
-                    // Intentar scroll en todos los contenedores posibles
-                    scrollTargets.forEach(target => {
-                        if (target) {
-                            try {
-                                // Bajar 300px desde la posición actual
-                                const currentScroll = target.scrollTop;
-                                target.scrollTo({
-                                    top: currentScroll + 300,
-                                    behavior: 'smooth'
-                                });
-                            } catch(e) {
-                                console.log("Error scrolling target:", e);
-                            }
-                        }
-                    });
-                    
-                    // Fallback global window scroll
                     window.scrollBy({
                         top: 300,
                         behavior: 'smooth'
                     });
-                    
                 } catch(e) {
                     console.error("Error en primer scroll:", e);
                 }
@@ -1712,98 +3720,90 @@ if user_name:
             unsafe_allow_html=True
         )
         
+        # Contenedor para descripción dinámica
+        description_placeholder = st.empty()
+        
+        # Variables para métricas
+        search_start_time = datetime.now()
+        
         try:
-            # Recuperar documentos usando búsqueda híbrida (BM25 + FAISS)
-            # SISTEMA ADAPTATIVO: K se ajusta según complejidad de la pregunta
-            k_info = get_optimal_k(query, force_exhaustive=exhaustive_search)
-            k_docs = k_info['k']
-            
-            # Mostrar información de búsqueda
-            st.markdown(
-                f'<div style="background: rgba(97, 175, 239, 0.1); border-left: 4px solid #61AFEF; padding: 12px; border-radius: 6px; margin: 10px 0;">'
-                f'<span style="color: #61AFEF; font-weight: bold;">📊 Búsqueda {k_info["level"].upper()}</span> '
-                f'<span style="color: #98C379;">• {k_docs} documentos</span> '
-                f'<span style="color: #E5C07B; font-size: 0.85em;">• {k_info["reason"]}</span>'
-                f'</div>',
-                unsafe_allow_html=True
-            )
-            
-            with st.spinner(f"🔍 Buscando con algoritmo híbrido (recuperando {k_docs} docs)..."):
-                search_method = "unknown"
-                search_start_time = time.time()  # Iniciar cronómetro de búsqueda
+            # 1. Búsqueda de documentos
+            with st.spinner("🔍 Buscando información relevante..."):
+                # NUEVO: Detectar si la pregunta menciona un título específico
+                title_info = detect_title_in_query(query_to_process)
                 
-                # ESTRATEGIA 1: Intentar búsqueda híbrida (BM25 + FAISS)
-                if RETRIEVERS_AVAILABLE:
-                    try:
-                        faiss_retriever = faiss_vs.as_retriever(search_kwargs={"k": k_docs})
-                        hybrid_retriever = HybridRetriever(
-                            faiss_retriever=faiss_retriever,
-                            bm25_path="bm25_index.pkl",
-                            k=k_docs,
-                            alpha=0.7  # 70% semántica, 30% léxica
-                        )
-                        docs = hybrid_retriever.invoke(query)
-                        search_method = "hybrid"
-                        
-                        # Verificar si usó BM25 puro (por nombres propios o palabras clave)
-                        query_lower = query.lower()
-                        asks_for_names = any(pattern in query_lower for pattern in [
-                            'nombre', 'nombres', 'quien', 'quienes', 'guardianes', 'maestros'
-                        ])
-                        query_words = query.split()
-                        has_proper_nouns = any(word[0].isupper() for word in query_words if len(word) > 2)
-                        proper_noun_keywords = [
-                            'maria', 'magdalena', 'jesus', 'cristo', 'jose', 'juan', 'pedro', 'pablo',
-                            'azoes', 'azen', 'aviatar', 'alaniso', 'axel', 'adiel', 'aladim', 'aliestro',
-                            'maestro', 'maestros', 'guardianes', 'guardian'
-                        ]
-                        has_name_keywords = any(word.lower() in proper_noun_keywords for word in query_words)
-                        
-                        if has_proper_nouns or has_name_keywords or asks_for_names:
-                            st.success("✅ Búsqueda de nombres/identidades → BM25 prioritario (coincidencias exactas)")
-                        else:
-                            st.success("✅ Búsqueda híbrida activada (BM25 + Embeddings)")
+                if title_info['has_title']:
+                    # Búsqueda con filtro por título
+                    print(f"[INFO] 🎯 Búsqueda híbrida con filtro de título activada")
+                    print(f"[INFO] Keywords detectadas: {title_info['keywords']}")
+                    print(f"[INFO] Patrón detectado: {title_info['pattern_matched']}")
                     
-                    # ESTRATEGIA 2: Si falla híbrida, usar BM25 puro (mejor para nombres propios)
-                    except Exception as e:
-                        st.warning(f"⚠️ Híbrida no disponible, usando BM25 puro (óptimo para nombres exactos)...")
-                        try:
-                            bm25_retriever = BM25Retriever(
-                                bm25_path="bm25_index.pkl",
-                                k=k_docs
-                            )
-                            docs = bm25_retriever.invoke(query)
-                            search_method = "bm25"
-                            st.info("✅ Búsqueda léxica BM25 (mejor para nombres propios y coincidencias exactas)")
-                        
-                        # ESTRATEGIA 3: Último recurso - FAISS solo
-                        except Exception as e2:
-                            st.error(f"⚠️ BM25 falló, usando FAISS básico...")
-                            faiss_retriever = faiss_vs.as_retriever(search_kwargs={"k": k_docs})
-                            docs = faiss_retriever.invoke(query)
-                            search_method = "faiss"
+                    # Determinar K según complejidad de la pregunta
+                    k_optimal = get_optimal_k(query_to_process, force_exhaustive=exhaustive_search)
+                    
+                    # Usar búsqueda híbrida con filtro por título
+                    docs = hybrid_search_with_title(
+                        faiss_vs=faiss_vs,
+                        query=query_to_process,
+                        all_docs=st.session_state.all_docs if 'all_docs' in st.session_state else [],
+                        k=k_optimal['k'],
+                        title_keywords=title_info['keywords']
+                    )
+                    
+                    search_method = 'hybrid_title_filter'
+                    
+                    # Mostrar información de debug en consola
+                    print(f"[INFO] Documentos recuperados con filtro: {len(docs)}")
+                    if len(docs) > 0:
+                        print(f"[INFO] Primer documento source: {docs[0].metadata.get('source', 'N/A')[:100]}")
+                    
                 else:
-                    # Si no hay retrievers, usar FAISS directamente
-                    st.info("ℹ️ Usando búsqueda FAISS (semántica)...")
-                    faiss_retriever = faiss_vs.as_retriever(search_kwargs={"k": k_docs})
-                    docs = faiss_retriever.invoke(query)
-                    search_method = "faiss"
-            
-            # Calcular tiempo de búsqueda
-            search_time = time.time() - search_start_time
-            
-            # Mostrar estadísticas de recuperación mejoradas
-            query_lower = query.lower()
-            relevant_docs = [d for d in docs if any(term in d.page_content.lower() for term in query_lower.split())]
+                    # Búsqueda normal sin filtro de título
+                    print(f"[INFO] 📊 Búsqueda híbrida estándar (sin filtro de título)")
+                    
+                    # Determinar método de búsqueda
+                    search_method = 'hybrid'
+                    
+                    # Obtener retriever
+                    if exhaustive_search:
+                        # Modo exhaustivo: Híbrido con más documentos (Quirúrgico)
+                        # Usa HybridRetriever.build para crear la instancia de forma segura
+                        retriever = HybridRetriever.build(
+                            faiss_retriever=faiss_vs.as_retriever(search_kwargs={"k": 400}),  # Aumentado a 400 para capturar docs cortos
+                            documents=st.session_state.all_docs if 'all_docs' in st.session_state else None,
+                            k=400,  # Aumentado a 400 para encontrar chunks únicos en docs pequeños
+                            alpha=0.6 
+                        )
+                        search_method = 'hybrid_surgical'
+                    else:
+                        # Modo normal: Híbrido estándar
+                        retriever = HybridRetriever.build(
+                            faiss_retriever=faiss_vs.as_retriever(search_kwargs={"k": 300}),  # Aumentado a 300 para capturar docs cortos
+                            documents=st.session_state.all_docs if 'all_docs' in st.session_state else None,
+                            k=300  # Aumentado a 300 para encontrar chunks únicos como 'cuerpo crístico ya se formó'
+                        )
+                    
+                    # Ejecutar búsqueda
+                    docs = retriever.invoke(query_to_process)
+                
+                # Filtrar por umbral de relevancia (simulado)
+                relevant_docs = docs 
+                
+                search_end_time = datetime.now()
+                search_time = (search_end_time - search_start_time).total_seconds()
             
             # Badge de método según el utilizado
             method_badges = {
                 'hybrid': '🎯 Híbrido',
+                'hybrid_surgical': '🧬 Híbrida Quirúrgica',
+                'hybrid_title_filter': '📑 Híbrida con Filtro de Título',
                 'faiss': '🔍 FAISS',
+                'faiss_exhaustive': '🚀 FAISS (Exhaustivo)',
                 'bm25': '📝 BM25'
             }
             method_badge = method_badges.get(search_method, '❓ Desconocido')
             
+            # Mostrar métricas de búsqueda
             st.markdown(
                 f'<div style="background: rgba(152, 195, 121, 0.1); border-left: 4px solid #98C379; padding: 12px; border-radius: 6px; margin: 10px 0;">'
                 f'<span style="color: #98C379; font-weight: bold;">✅ BÚSQUEDA COMPLETADA</span><br/>'
@@ -1814,10 +3814,49 @@ if user_name:
                 f'</div>',
                 unsafe_allow_html=True
             )
+
+            # [NUEVO] Visualización de Scores de Relevancia (Forensic Score Board)
+            with st.expander(f"🔍 Analizar Scores de Relevancia (Evidencia Forense)", expanded=False):
+                st.markdown("*Los scores indican la probabilidad de que el fragmento responda la pregunta (0.0 - 1.0)*")
+                for i, doc in enumerate(docs):
+                    # Obtener score (default 0 si no existe)
+                    score = doc.metadata.get('relevance_score', 0.0)
+                    
+                    # Lógica de color semáforo
+                    if score >= 0.95:
+                        color = "#00ff41" # Verde neón (Perfecto)
+                        label = "🟢 EXACTO"
+                    elif score >= 0.85:
+                        color = "#FFFF00" # Amarillo (Muy alto)
+                        label = "🟡 MUY RELEVANTE"
+                    elif score >= 0.70:
+                        color = "#cccccc" # Gris/Blanco (Relevante)
+                        label = "⚪ RELEVANTE"
+                    else:
+                        color = "#ff4b4b" # Rojo (Bajo)
+                        label = "🔴 BAJA RELEVANCIA"
+                    
+                    source = doc.metadata.get('source', 'Desconocido')
+                    # Limpiar source para mostrar solo nombre archivo
+                    source_name = os.path.basename(source)
+                    content_preview = doc.page_content[:200].replace("\n", " ") + "..."
+                    
+                    st.markdown(
+                        f"""
+                        <div style="background: rgba(255,255,255,0.05); padding: 10px; border-radius: 5px; margin-bottom: 8px; border-left: 3px solid {color};">
+                            <div style="display: flex; justify-content: space-between; align-items: center;">
+                                <span style="font-weight: bold; color: {color}; font-family: monospace; font-size: 1.1em;">{label} ({score:.2f})</span>
+                                <span style="font-size: 0.8em; color: #888;">Rank #{i+1}</span>
+                            </div>
+                            <div style="font-size: 0.9em; color: #aaa; margin-top: 4px; font-weight: bold;">📄 {source_name}</div>
+                            <div style="font-size: 0.85em; color: #ccc; margin-top: 4px; font-style: italic;">"{content_preview}"</div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True
+                    )
             
             # Mostrar GIF de procesamiento animado
             if os.path.exists("assets/pregunta.gif"):
-                # Usar HTML directo para que el GIF se anime correctamente
                 st.markdown(
                     '''<div class="gif-container" style="text-align: center;">
                         <img src="data:image/gif;base64,{}" width="300">
@@ -1832,7 +3871,6 @@ if user_name:
 
             # Crear banderas para saber si estamos en Streamlit Cloud
             if "running_in_cloud" not in st.session_state:
-                # Streamlit Cloud define esta variable en secrets
                 st.session_state.running_in_cloud = bool(os.getenv("STREAMLIT_RUNTIME", "")) or bool(os.getenv("STREAMLIT_CLOUD", ""))
 
             # Mensaje de búsqueda grande en verde neón
@@ -1850,7 +3888,7 @@ if user_name:
                 unsafe_allow_html=True
             )
             
-            with st.spinner(""):  # Spinner vacío para mantener el estado de carga
+            with st.spinner(""):
                 chain = (
                     {
                         "context": lambda x: format_docs(docs),
@@ -1862,52 +3900,16 @@ if user_name:
                 )
                 
                 # Ejecutar
-                response = chain.invoke({"input": query})
+                response = chain.invoke({"input": query_to_process})
             
             # Limpiar mensaje de estado
             status_placeholder.empty()
             
             # ═══════════════════════════════════════════════════════════════
-            # 🎉 NOTIFICACIONES DE RESPUESTA LISTA
+            # PROCESAMIENTO FINAL Y PERSISTENCIA
             # ═══════════════════════════════════════════════════════════════
             
-            # 1. Toast notification (esquina superior derecha)
-            st.toast('✨ ¡Respuesta lista! Desplázate hacia arriba para leerla.', icon='✅')
-            
-            # 2. Animación de globos
-            st.balloons()
-            
-            # 3. Sonido de aviso (campana)
-            st.markdown("""
-                <audio autoplay>
-                    <source src="data:audio/mp3;base64,SUQzBAAAAAAAI1RTU0UAAAAPAAADTGF2ZjU4Ljc2LjEwMAAAAAAAAAAAAAAA//tQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWGluZwAAAA8AAAACAAADhAC7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7/////////////////////////////////////////////////////////////////wAAAABMYXZmNTguNzYuMTAwAAAAAAAAAAAAAAAAJAAAAAAAAAAAA4TjGlKMAAAAAAAAAAAAAAAAAAAA//sQZAAP8AAAaQAAAAgAAA0gAAABAAABpAAAACAAADSAAAAETEFNRTMuMTAwVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV" type="audio/mpeg">
-                </audio>
-                <script>
-                    // Sonido de campana corto y agradable
-                    const audioContext = new (window.AudioContext || window.webkitAudioContext)();
-                    const oscillator = audioContext.createOscillator();
-                    const gainNode = audioContext.createGain();
-                    
-                    oscillator.connect(gainNode);
-                    gainNode.connect(audioContext.destination);
-                    
-                    // Sonido tipo "ding" (campana)
-                    oscillator.frequency.value = 880; // A5 (nota aguda)
-                    oscillator.type = 'sine';
-                    
-                    // Envelope: ataque rápido, decay suave
-                    gainNode.gain.setValueAtTime(0, audioContext.currentTime);
-                    gainNode.gain.linearRampToValueAtTime(0.3, audioContext.currentTime + 0.01);
-                    gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.5);
-                    
-                    oscillator.start(audioContext.currentTime);
-                    oscillator.stop(audioContext.currentTime + 0.5);
-                </script>
-            """, unsafe_allow_html=True)
-            
-            # ═══════════════════════════════════════════════════════════════
-            
-            # Calcular tiempo total de respuesta
+            # Calcular tiempo total
             query_end_time = datetime.now()
             total_time = (query_end_time - query_start_time).total_seconds()
             
@@ -1915,400 +3917,98 @@ if user_name:
             st.session_state.conversation_history.append({
                 'timestamp': query_end_time.strftime("%Y-%m-%d %H:%M:%S"),
                 'user': user_name.upper(),
-                'query': query,
+                'query': query_to_process,
                 'response': response
             })
             
-            # Limpiar descripción inmediatamente si era la primera pregunta
+            # Limpiar descripción inmediatamente
             description_placeholder.empty()
             
-            # Marcar para limpiar campo en siguiente render
+            # Marcar para limpiar campo
             st.session_state.clear_query = True
             st.session_state.last_query = ""
             
-            # Logging a Google Sheets
+            # LOGGING A GOOGLE SHEETS
             if st.session_state.sheets_logger:
                 try:
-                    # Generar ID único para esta interacción
                     interaction_id = str(uuid.uuid4())
                     
-                    # Detectar dispositivo y ubicación
-                    device_info = {"device_type": "PC", "browser": "Local", "os": "Windows"}
+                    # Usar IP REAL detectada automáticamente al login
+                    # Esta IP se detectó con JavaScript en el navegador del cliente
+                    location_info = {
+                        "city": st.session_state.get('user_city', 'Desconocida'),
+                        "country": st.session_state.get('user_country', 'Desconocido'),
+                        "ip": st.session_state.get('user_ip', 'No detectado')  # IP REAL
+                    }
                     
-                    # Usar ciudad y país del usuario si están disponibles (ingreso manual)
-                    user_city = st.session_state.get('user_city', 'Local')
-                    user_country = st.session_state.get('user_country', 'Colombia')
-                    location_info = {"city": user_city, "country": user_country, "ip": "127.0.0.1"}
+                    # Detectar dispositivo (simplificado)
+                    device_info = {"device_type": "Web", "browser": "Unknown", "os": "Unknown"}
                     
-                    # Detectar dispositivo y ubicación SOLO en Streamlit Cloud
+                    # Intentar detección de dispositivo si está disponible
                     if GOOGLE_SHEETS_AVAILABLE:
                         try:
-                            # Intentar obtener User-Agent (solo disponible en Cloud)
                             if hasattr(st, "context") and hasattr(st.context, "headers"):
                                 user_agent = st.context.headers.get("User-Agent", "Unknown")
-                                
-                                # Detectar dispositivo
                                 device_detector = DeviceDetector()
                                 device_info_full = device_detector.detect_from_web(user_agent)
                                 device_info = {
-                                    "device_type": device_info_full.get("tipo", "PC"),
-                                    "browser": device_info_full.get("navegador", "Local"),
-                                    "os": device_info_full.get("os", "Windows")
+                                    "device_type": device_info_full.get("tipo", "Web"),
+                                    "browser": device_info_full.get("navegador", "Unknown"),
+                                    "os": device_info_full.get("os", "Unknown")
                                 }
-                                
-                                
-                                # ═══════════════════════════════════════════════════════════════
-                                # GEOLOCALIZACIÓN CON IP REAL DEL USUARIO
-                                # La IP se obtiene del JavaScript que se ejecuta AL INICIO de la app
-                                # ═══════════════════════════════════════════════════════════════
-                                
-                                geo_locator = GeoLocator()
-                                
-                                # Obtener IP (probablemente será del servidor en Streamlit Cloud)
-                                location_data = geo_locator.get_location()
-                                detected_ip = location_data.get('ip', '')
-                                
-                                # ═══════════════════════════════════════════════════════════════
-                                # DETECCIÓN DE SERVIDORES CLOUD (Streamlit, Google Cloud, AWS, etc.)
-                                # ═══════════════════════════════════════════════════════════════
-                                cloud_ip_ranges = [
-                                    "35.203.",   # Streamlit Cloud - The Dalles, Oregon
-                                    "35.245.",   # Google Cloud
-                                    "35.247.",   # Google Cloud
-                                    "34.86.",    # Google Cloud
-                                    "34.87.",    # Google Cloud
-                                    "34.105.",   # Google Cloud
-                                    "35.184.",   # Google Cloud
-                                    "35.188.",   # Google Cloud
-                                ]
-                                
-                                is_cloud_server = any(detected_ip.startswith(prefix) for prefix in cloud_ip_ranges)
-                                
-                                if is_cloud_server:
-                                    # SOBRESCRIBIR datos con información genérica
-                                    location_data = {
-                                        "ciudad": "🌐 Usuario Web",
-                                        "pais": "Acceso Remoto",
-                                        "ip": "Protegido",
-                                        "region": "N/A",
-                                        "codigo_pais": "N/A",
-                                        "timezone": "N/A",
-                                        "org": "Streamlit Cloud",
-                                        "fuente": "cloud_detection"
-                                    }
-                                    print(f"")
-                                    print(f"{'='*60}")
-                                    print(f"🌐 SERVIDOR CLOUD DETECTADO (IP: {detected_ip})")
-                                    print(f"✓ Mostrando: Usuario Web / Acceso Remoto")
-                                    print(f"{'='*60}")
-                                    print(f"")
-                                else:
-                                    # IP real del usuario (ejecución local)
-                                    print(f"")
-                                    print(f"{'='*60}")
-                                    print(f"✓✓✓ IP DEL USUARIO: {detected_ip}")
-                                    print(f"✓✓✓ Ciudad: {location_data.get('ciudad', 'N/A')}")
-                                    print(f"✓✓✓ País: {location_data.get('pais', 'N/A')}")
-                                    print(f"✓✓✓ Fuente API: {location_data.get('fuente', 'N/A')}")
-                                    print(f"{'='*60}")
-                                    print(f"")
+                        except Exception:
+                            pass
 
-                                
-                                if location_data:
-                                    location_info = {
-                                        "city": location_data.get("ciudad", "Desconocido"),
-                                        "country": location_data.get("pais", "Desconocido"),
-                                        "ip": location_data.get("ip", "Desconocido")
-                                    }
-                                    print(f"[INFO] Geolocalización FINAL: {location_info['city']}, {location_info['country']} - IP: {location_info['ip']}")
-
-
-                        except Exception as e:
-                            print(f"[WARNING] Error detectando dispositivo/ubicación (usando valores por defecto): {e}")
-                    
-                    # Limpiar respuesta (quitar HTML)
+                    # Limpiar respuesta (solo para otros usos, NO para Sheets)
                     answer_clean = _strip_html_tags(response)
                     
-                    # Registrar en Google Sheets (solo si el logger está habilitado)
-                    if st.session_state.sheets_logger and st.session_state.sheets_logger.enabled:
-                        print(f"[DEBUG] Intentando registrar interacción: {user_name.upper()} - {query[:50]}...")
+                    if st.session_state.sheets_logger.enabled:
+                        user_email_value = st.session_state.get('user_email', 'No disponible')
+                        print(f"[DEBUG] Email al guardar en Sheets: '{user_email_value}'")  # Debuggear
+                        
                         st.session_state.sheets_logger.log_interaction(
                             interaction_id=interaction_id,
                             user=user_name.upper(),
-                            question=query,
-                            answer=answer_clean,
+                            question=query_to_process,
+                            answer=response,  # ← CAMBIADO: Pasar HTML con colores, NO answer_clean
                             device_info=device_info,
                             location_info=location_info,
                             timing={"total_time": total_time},
-                            success=True
+                            success=True,
+                            user_email=user_email_value  # ← AGREGADO: Email
                         )
-                        print(f"[OK] Interacción registrada exitosamente")
-                    else:
-                        print("[WARNING] Google Sheets Logger no está habilitado - interacción no registrada")
-                except Exception as e:
-                    print(f"[ERROR] Error logging a Google Sheets: {e}")
-                    import traceback
-                    traceback.print_exc()
-            
-            # Mostrar respuesta
-            st.success("✅ Análisis completado")
-            
-            st.markdown("### 🔬 Resultado del Análisis:")
-            # Colorear las citas antes de mostrar
-            colored_response = colorize_citations(response)
-            # IMPORTANTE: Usar st.html() en vez de st.markdown() para preservar los estilos inline
-            st.html(f'<div class="response-container" id="respuesta-gerard">{colored_response}</div>')
-            
-            # Estadísticas
-            st.markdown(
-                f'<div class="stats">'
-                f'📊 Documentos analizados: {len(docs)} | '
-                f'👤 Usuario: {user_name.upper()} | '
-                f'🕐 Timestamp: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'
-                f'</div>',
-                unsafe_allow_html=True
-            )
-            
-            # SEGUNDO SCROLL: Automático hacia el final de la respuesta
-            # SOLUCIÓN RADICAL: Inyectar script directamente en el DOM usando st.markdown
-            # Esto evita el problema del iframe aislado de components.html
-            
-            scroll_placeholder_2 = st.empty()
-            scroll_placeholder_2.markdown(
-                """
-                <script>
-                (function() {
-                    function forceScrollToBottom() {
-                        try {
-                            // Identificar todos los posibles contenedores de scroll
-                            const targets = [
-                                document.querySelector('[data-testid="stAppViewContainer"]'), // Principal en versiones nuevas
-                                document.querySelector('.main'), // Principal en versiones viejas
-                                document.querySelector('.stApp'),
-                                document.documentElement,
-                                document.body
-                            ];
+                except Exception as e_log:
+                    print(f"Error logging: {e_log}")
 
-                            targets.forEach(target => {
-                                if (target) {
-                                    try {
-                                        // Calcular el máximo scroll posible
-                                        const maxScroll = target.scrollHeight - target.clientHeight;
-                                        
-                                        if (maxScroll > 0 && maxScroll > target.scrollTop) {
-                                            // Usar scrollTo nativo con behavior smooth
-                                            target.scrollTo({
-                                                top: maxScroll,
-                                                behavior: 'smooth'
-                                            });
-                                        }
-                                    } catch(e) {
-                                        console.log("Error scrolling target:", e);
-                                    }
-                                }
-                            });
-                            
-                            // Intento global en window
-                            window.scrollTo({
-                                top: document.body.scrollHeight,
-                                behavior: 'smooth'
-                            });
-                            
-                        } catch(e) {
-                            console.error("Error en scroll final:", e);
-                        }
-                    }
-                    
-                    // Ejecutar múltiples veces para asegurar que carga todo el contenido dinámico
-                    // Tiempos escalonados para capturar diferentes velocidades de renderizado
-                    setTimeout(forceScrollToBottom, 300);
-                    setTimeout(forceScrollToBottom, 1000);
-                    setTimeout(forceScrollToBottom, 2500);
-                    setTimeout(forceScrollToBottom, 5000); // Último intento tardío para móviles lentos
-                    
-                })();
-                </script>
-                """,
-                unsafe_allow_html=True
-            )
+            # GUARDAR RESULTADOS PARA VISUALIZACIÓN PERSISTENTE
+            st.session_state.last_results = {
+                'response': response,
+                'docs': docs,
+                'search_time': search_time,
+                'search_method': search_method,
+                'relevant_docs_count': len(relevant_docs)
+            }
             
-            # Botón de descarga PDF (compatible con iframes, PC y móviles)
-            if REPORTLAB_AVAILABLE and len(st.session_state.conversation_history) > 0:
-                st.markdown("---")
-                st.markdown("### 📥 Exportar Conversación")
-                
-                try:
-                    # Construir HTML de toda la conversación
-                    html_parts = []
-                    for entry in st.session_state.conversation_history:
-                        html_parts.append(f'<p style="color: #000000; font-weight: bold;">Pregunta ({entry["timestamp"]}):</p>')
-                        html_parts.append(f'<p style="color: #000000;">{entry["query"]}</p>')
-                        html_parts.append(f'<p style="color: #000000; font-weight: bold;">Respuesta:</p>')
-                        # Aplicar colorización a la respuesta antes de exportar
-                        colored_response = colorize_citations(entry["response"])
-                        html_parts.append(f'<p>{colored_response}</p>')
-                        html_parts.append('<br/>')
-                    
-                    html_parts.append(f'<br/><p style="color: #28a745;">Usuario: {user_name.upper()}</p>')
-                    html_full = ''.join(html_parts)
-                    
-                    # Generar PDF con título completo y sin cortes
-                    pdf_bytes = generate_pdf_from_html_local(
-                        html_full,
-                        title_base=f"Consulta GERARD - {user_name.upper()}",
-                        user_name=user_name.upper()
-                    )
-                    
-                    # Nombre del archivo PDF usando formato original con preguntas
-                    timestamp_str = datetime.now().strftime("%Y%m%d_%H%M")
-                    safe_username = "".join(c for c in user_name if c.isalnum() or c in (' ', '_', '-')).strip().replace(' ', '_')
-                    
-                    # Construir nombre con TODAS las preguntas (sin límite)
-                    question_parts = []
-                    for entry in st.session_state.conversation_history:
-                        # Limpiar pregunta (SIN truncar - mostrar pregunta completa)
-                        clean_q = "".join(c for c in entry["query"] if c.isalnum() or c in (' ', '_', '-', '?')).strip()
-                        clean_q = clean_q.replace(' ', '_')
-                        # SIN límite de longitud - pregunta completa
-                        if clean_q:
-                            question_parts.append(clean_q)
-                    
-                    # Formato: CONSULTA_DE_[USUARIO]_[pregunta1]?_[pregunta2]?_[pregunta3]?_..._[FECHA]_[HORA].pdf
-                    if question_parts:
-                        questions_str = "_".join(f"{q}?" for q in question_parts)
-                        pdf_filename = f"CONSULTA_DE_{safe_username}_{questions_str}_{timestamp_str}.pdf"
-                    else:
-                        # Fallback si no hay preguntas
-                        pdf_filename = f"CONSULTA_DE_{safe_username}_{timestamp_str}.pdf"
-                    
-                    # Convertir bytes a base64 para JavaScript
-                    pdf_b64 = base64.b64encode(pdf_bytes).decode()
-                    
-                    # JavaScript para descarga compatible con iframes, PC y móviles
-                    download_js = f"""
-                    <script>
-                    var pdfDownloaded = false;
-                    
-                    // Verificar si ya se descargó este PDF al cargar la página
-                    window.addEventListener('DOMContentLoaded', function() {{
-                        const btn = document.getElementById('pdf-download-btn');
-                        if (sessionStorage.getItem('pdfDownloaded_{len(st.session_state.conversation_history)}') === 'true') {{
-                            if (btn) {{
-                                btn.style.background = 'linear-gradient(45deg, #00FF41, #00CC33)';
-                                btn.style.borderColor = '#00FF41';
-                                btn.style.boxShadow = '0 0 20px rgba(0, 255, 65, 0.6)';
-                                btn.innerHTML = '✅ ¡Descargado Exitosamente!';
-                                pdfDownloaded = true;
-                            }}
-                        }}
-                    }});
-                    
-                    function downloadPDF() {{
-                        if (pdfDownloaded) return; // Evitar descargas múltiples
-                        
-                        try {{
-                            // Crear blob desde base64
-                            const byteCharacters = atob('{pdf_b64}');
-                            const byteNumbers = new Array(byteCharacters.length);
-                            for (let i = 0; i < byteCharacters.length; i++) {{
-                                byteNumbers[i] = byteCharacters.charCodeAt(i);
-                            }}
-                            const byteArray = new Uint8Array(byteNumbers);
-                            const blob = new Blob([byteArray], {{type: 'application/pdf'}});
-
-                            // Crear enlace de descarga
-                            const url = URL.createObjectURL(blob);
-                            const a = document.createElement('a');
-                            a.href = url;
-                            a.download = '{pdf_filename}';
-                            document.body.appendChild(a);
-                            a.click();
-                            document.body.removeChild(a);
-                            URL.revokeObjectURL(url);
-                            
-                            // Cambiar botón a VERDE NEÓN y mostrar éxito
-                            const btn = document.getElementById('pdf-download-btn');
-                            if (btn) {{
-                                btn.style.background = 'linear-gradient(45deg, #00FF41, #00CC33)';
-                                btn.style.borderColor = '#00FF41';
-                                btn.style.boxShadow = '0 0 20px rgba(0, 255, 65, 0.6)';
-                                btn.innerHTML = '✅ ¡Descargado Exitosamente!';
-                                pdfDownloaded = true;
-                                
-                                // Guardar estado en sessionStorage para persistir
-                                sessionStorage.setItem('pdfDownloaded_{len(st.session_state.conversation_history)}', 'true');
-                            }}
-                            
-                            // Mostrar alerta nativa de éxito
-                            alert('✅ PDF descargado exitosamente. Revisa tu carpeta de descargas.');
-                            
-                        }} catch (e) {{
-                            console.error('Error en descarga:', e);
-                            alert('❌ Error al descargar PDF. Intente nuevamente.');
-                        }}
-                    }}
-                    </script>
-                    <button id="pdf-download-btn" onclick="downloadPDF()" style="
-                        background: linear-gradient(45deg, #ff4b4b, #ff8080);
-                        color: white;
-                        border: 2px solid #ff4b4b;
-                        padding: 12px 20px;
-                        border-radius: 8px;
-                        cursor: pointer;
-                        font-size: 16px;
-                        font-weight: bold;
-                        width: 100%;
-                        margin: 10px 0;
-                        transition: all 0.3s ease;
-                        box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-                    " onmouseover="if(!pdfDownloaded) this.style.transform='scale(1.02)'" 
-                       onmouseout="if(!pdfDownloaded) this.style.transform='scale(1)'">
-                        📄 Descargar PDF ({len(st.session_state.conversation_history)} consulta{"s" if len(st.session_state.conversation_history) > 1 else ""})
-                    </button>
-                    """
-                    
-                    st.components.v1.html(download_js, height=80)
-                    
-                except Exception as e:
-                    st.error(f"❌ Error generando PDF: {e}")
-            elif not REPORTLAB_AVAILABLE:
-                st.info("ℹ️ Descarga PDF no disponible (instala reportlab: pip install reportlab)")
-            
-            # Historial de consultas anteriores
-            if len(st.session_state.conversation_history) > 1:
-                st.markdown("---")
-                with st.expander(f"📚 Historial de consultas ({len(st.session_state.conversation_history) - 1} anterior{'es' if len(st.session_state.conversation_history) > 2 else ''})"):
-                    for i, entry in enumerate(st.session_state.conversation_history[:-1]):
-                        st.markdown(f"**🔍 Consulta #{i+1}** — _{entry['timestamp']}_")
-                        st.markdown(f"**Pregunta:** {entry['query']}")
-                        if st.button(f"👁️ Ver respuesta completa", key=f"view_resp_{i}"):
-                            st.markdown(entry['response'], unsafe_allow_html=True)
-                        st.markdown("---")
-            
-            # Botón Nueva Consulta
-            st.markdown("<br>", unsafe_allow_html=True)
-            col1, col2, col3 = st.columns([1, 2, 1])
-            with col2:
-                if st.button("➕ NUEVA CONSULTA", key="new_query_btn", use_container_width=True):
-                    # Scroll to top
-                    components.html("""
-                        <script>
-                        window.parent.document.querySelector('.main').scrollTo({top: 0, behavior: 'smooth'});
-                        </script>
-                    """, height=0)
-                    st.rerun()
-            
-            # Guardar en log
-            with open("gerard_web_log.txt", "a", encoding="utf-8") as f:
-                f.write(f"\n{'='*80}\n")
-                f.write(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                f.write(f"Usuario: {user_name.upper()}\n")
-                f.write(f"Consulta: {query}\n")
-                f.write(f"Respuesta:\n{response}\n")
-                f.write(f"{'='*80}\n")
+            # MARCAR COMO EJECUTADO Y RECARGAR
+            st.session_state.question_executed = True
+            st.session_state.last_executed_query = query
+            st.rerun()
             
         except Exception as e:
             st.error(f"❌ Error durante el análisis: {str(e)}")
+
+    # MOSTRAR RESULTADOS PERSISTENTES (Fuera del if search_button)
+    # Nota: Usamos last_executed_query porque query podría estar vacío después del rerun (especialmente con micrófono)
+    if st.session_state.question_executed and st.session_state.get('last_executed_query') and 'last_results' in st.session_state:
+        res = st.session_state.last_results
+        display_analysis_result(
+            res['response'], 
+            res['docs'], 
+            res['search_time'], 
+            res['search_method'], 
+            res['relevant_docs_count'], 
+            user_name
+        )
 
 # Pie de página
 # Pie de página fijo y estilizado

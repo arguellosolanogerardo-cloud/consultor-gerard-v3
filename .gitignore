@@ -1,4 +1,4 @@
-﻿# Python
+# Python
 __pycache__/
 *.py[cod]
 *.class
@@ -7,6 +7,7 @@ __pycache__/
 venv/
 ENV/
 env/
+.venv_clean/
 
 # FAISS y índices grandes (NO van a GitHub)
 faiss_index_backup/
@@ -40,6 +41,11 @@ client_secret.json
 google_credentials.json
 .streamlit/secrets.toml
 test_credentials.json
+.env
+credentials.json
+credencial json/
+test_user_creds.json
+boton-google.json
 
 # Archivos de documentación local (grandes)
 documentos_srt/
