@@ -1340,11 +1340,19 @@ def load_resources():
                 model="models/text-embedding-004",
                 google_api_key=api_key
             )
+            os.environ["GERARD_LLM_BACKEND"] = "Google AI Studio (API Key)"
+            os.environ["GERARD_LLM_BACKEND_ERR"] = ""
             print("[OK] Inicializado exitosamente con Google AI Studio (API Key)")
         except Exception as e:
+            os.environ["GERARD_LLM_BACKEND_ERR"] = str(e)
             print(f"[WARNING] Falló inicialización con Google AI Studio: {e}. Usando fallback a Vertex AI...")
             llm = None
             embeddings = None
+    else:
+        if not GENAI_AVAILABLE:
+            os.environ["GERARD_LLM_BACKEND_ERR"] = "Librería langchain_google_genai no disponible"
+        elif not api_key:
+            os.environ["GERARD_LLM_BACKEND_ERR"] = "GOOGLE_API_KEY no configurada en variables de entorno ni st.secrets"
 
     if llm is None or embeddings is None:
         # Fallback original: Vertex AI (Cuenta de Servicio)
@@ -1357,6 +1365,7 @@ def load_resources():
             model_name="text-multilingual-embedding-002",
             project="midyear-node-436821-t3"
         )
+        os.environ["GERARD_LLM_BACKEND"] = "Vertex AI (Cuenta de Servicio)"
         print("[INFO] Usando Vertex AI (Cuenta de Servicio)")
     
     # FAISS Vector Store
@@ -2231,6 +2240,20 @@ with st.sidebar:
     if st.session_state.get('user_email'):
         st.markdown(f"📧 {st.session_state.user_email}")
     
+    st.markdown("---")
+    
+    # === DIAGNÓSTICO DE IA ===
+    backend = os.environ.get("GERARD_LLM_BACKEND", "No inicializado")
+    err_backend = os.environ.get("GERARD_LLM_BACKEND_ERR", "")
+    
+    st.markdown("### 🧠 Motor de IA")
+    if "API Key" in backend:
+        st.success(f"🤖 {backend}")
+    else:
+        st.warning(f"🌩️ {backend}")
+        if err_backend:
+            st.error(f"Error AI Studio: {err_backend[:150]}")
+            
     st.markdown("---")
     
     # === BOTÓN CERRAR SESIÓN ===
